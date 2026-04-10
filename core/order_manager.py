@@ -1,10 +1,115 @@
 """Order management system."""
 
 import threading
+from dataclasses import dataclass, field
+from enum import Enum
 from typing import Dict, List, Optional
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from api.backpack import BackpackClient
+
+
+class Distribution(str, Enum):
+    """Tiered order distribution modes.
+
+    LINEAR_EVEN:       equal dollar gap between rungs, equal size per rung.
+                       Best for narrow ranges (<~5%), stablecoins, quick splits.
+
+    GEOMETRIC_EVEN:    equal percentage gap between rungs, equal size per rung.
+                       Best for wide ranges where you think in percentages.
+
+    GEOMETRIC_PYRAMID: equal percentage gap between rungs, size weighted toward
+                       the far end of the range (bottom for buys, top for sells).
+                       Best for DCA accumulation and distribution — improves
+                       average fill price on partial fills.
+    """
+
+    LINEAR_EVEN = "linear-even"
+    GEOMETRIC_EVEN = "geometric-even"
+    GEOMETRIC_PYRAMID = "geometric-pyramid"
+
+
+def _generate_prices(
+    price_low: Decimal,
+    price_high: Decimal,
+    num_orders: int,
+    distribution: Distribution,
+) -> List[Decimal]:
+    """Generate price levels according to the distribution mode.
+
+    For LINEAR_EVEN, rungs are evenly spaced in absolute price.
+    For GEOMETRIC_EVEN and GEOMETRIC_PYRAMID, rungs are evenly spaced in
+    log-price (equal percentage gap between consecutive rungs).
+    """
+    if num_orders == 1:
+        return [(price_low + price_high) / Decimal(2)]
+
+    if distribution == Distribution.LINEAR_EVEN:
+        step = (price_high - price_low) / Decimal(num_orders - 1)
+        return [price_low + step * Decimal(i) for i in range(num_orders)]
+
+    # Geometric: P_i = low * r^i, r = (high/low)^(1/(N-1))
+    ratio = (price_high / price_low) ** (Decimal(1) / Decimal(num_orders - 1))
+    return [price_low * (ratio ** Decimal(i)) for i in range(num_orders)]
+
+
+def _generate_size_weights(
+    num_orders: int,
+    distribution: Distribution,
+    size_scale: Decimal,
+    side: str,
+) -> List[Decimal]:
+    """Generate normalized size weights that sum to 1.0.
+
+    Flat distributions return equal weights regardless of size_scale.
+    GEOMETRIC_PYRAMID ramps linearly from 1.0 to size_scale across the N rungs:
+      - side == "Bid" (buy): heavy at bottom (i=0, lowest price)
+      - side == "Ask" (sell): heavy at top (i=N-1, highest price)
+    """
+    if num_orders == 1:
+        return [Decimal(1)]
+
+    is_pyramid = (
+        distribution == Distribution.GEOMETRIC_PYRAMID and size_scale != Decimal(1)
+    )
+    if not is_pyramid:
+        w = Decimal(1) / Decimal(num_orders)
+        return [w] * num_orders
+
+    # Linear ramp from 1.0 to size_scale across rungs
+    raw: List[Decimal] = []
+    for i in range(num_orders):
+        t = Decimal(i) / Decimal(num_orders - 1)
+        if side == "Bid":
+            # Heavy at i=0 (lowest price)
+            w = size_scale - (size_scale - Decimal(1)) * t
+        else:
+            # Heavy at i=N-1 (highest price)
+            w = Decimal(1) + (size_scale - Decimal(1)) * t
+        raw.append(w)
+
+    total = sum(raw, Decimal(0))
+    return [w / total for w in raw]
+
+
+@dataclass
+class TierPlan:
+    """A pre-computed tiered order plan — all math done, ready to execute."""
+
+    symbol: str
+    side: str  # "Bid" or "Ask"
+    distribution: Distribution
+    size_scale: Decimal
+    num_orders: int
+    price_low: Decimal
+    price_high: Decimal
+    prices: List[Decimal]
+    quantities: List[Decimal]
+    values: List[Decimal]  # price * quantity per rung
+    total_value: Decimal
+    total_quantity: Decimal
+    avg_fill_price: Decimal
+    warnings: List[str] = field(default_factory=list)
 
 
 class Order:
@@ -312,98 +417,252 @@ class OrderManager:
         except Exception as e:
             return (index, None, f"  Order {index}/{total}: {quantity:.4f} @ ${price:.4f} - Error: {e}")
 
-    def place_tiered_orders(self, symbol: str, side: str, price_low: float, price_high: float,
-                           num_orders: int, total_value: Optional[float] = None,
-                           total_quantity: Optional[float] = None) -> List[Optional[Order]]:
-        """Place multiple tiered limit orders across a price range (parallel).
+    def build_tier_plan(
+        self,
+        symbol: str,
+        side: str,
+        price_low: float,
+        price_high: float,
+        num_orders: int,
+        total_value: Optional[float] = None,
+        total_quantity: Optional[float] = None,
+        distribution: Distribution = Distribution.GEOMETRIC_PYRAMID,
+        size_scale: float = 1.5,
+    ) -> Optional[TierPlan]:
+        """Compute a tiered order plan without placing any orders.
 
-        Exactly one of `total_value` or `total_quantity` must be provided.
-        - total_value: total to spend in quote currency; quantity per level is derived per-price
-        - total_quantity: total base-currency amount; split evenly across levels
+        Exactly one of ``total_value`` or ``total_quantity`` must be provided.
+        - total_value: total to spend in quote currency (best for buys)
+        - total_quantity: total base-currency amount (best for sells)
 
         Args:
             symbol: Trading pair symbol
             side: "Bid" for buy, "Ask" for sell
             price_low: Lower price bound
-            price_high: Higher price bound
-            num_orders: Number of orders to place
+            price_high: Upper price bound
+            num_orders: Number of rungs
             total_value: Total value in quote currency (optional)
             total_quantity: Total quantity in base currency (optional)
+            distribution: Price/size distribution mode
+            size_scale: Pyramid scale factor (1.0=flat, 1.5=mild, 3.0=aggressive)
 
         Returns:
-            List of Order objects (None for failed orders)
+            TierPlan on success, None on invalid input (error printed).
         """
+        # Validation
         if (total_value is None) == (total_quantity is None):
             print("Must provide exactly one of total_value or total_quantity")
-            return []
-
+            return None
         if num_orders <= 0:
             print("Number of orders must be greater than 0")
-            return []
-
+            return None
         if price_low >= price_high:
             print("Lower price must be less than higher price")
-            return []
+            return None
+        if price_low <= 0 or price_high <= 0:
+            print("Prices must be greater than 0")
+            return None
+        if size_scale < 1.0:
+            print("size_scale must be >= 1.0")
+            return None
+        if side not in ("Bid", "Ask"):
+            print(f"Invalid side: {side} (expected 'Bid' or 'Ask')")
+            return None
+        if total_value is not None and total_value <= 0:
+            print("total_value must be > 0")
+            return None
+        if total_quantity is not None and total_quantity <= 0:
+            print("total_quantity must be > 0")
+            return None
 
-        # Calculate price levels
-        if num_orders == 1:
-            prices = [(price_low + price_high) / 2]
-        else:
-            price_step = (price_high - price_low) / (num_orders - 1)
-            prices = [price_low + (i * price_step) for i in range(num_orders)]
+        low = Decimal(str(price_low))
+        high = Decimal(str(price_high))
+        scale = Decimal(str(size_scale))
 
-        # Build order specs and header based on mode
+        warnings: List[str] = []
+
+        # Safety rail: geometric spacing on narrow ranges degenerates to linear
+        range_pct = (high - low) / low * Decimal(100)
+        if distribution in (Distribution.GEOMETRIC_EVEN, Distribution.GEOMETRIC_PYRAMID):
+            if range_pct < Decimal(2):
+                warnings.append(
+                    f"Range is only {range_pct:.2f}% — geometric spacing degenerates "
+                    f"to linear at narrow ranges"
+                )
+
+        # Safety rail: aggressive pyramid approaches martingale territory
+        if distribution == Distribution.GEOMETRIC_PYRAMID and scale > Decimal(3):
+            warnings.append(
+                f"size_scale={scale} is very aggressive (>3x) — approaches "
+                f"martingale risk profile"
+            )
+
+        # Compute prices and weights
+        prices = _generate_prices(low, high, num_orders, distribution)
+        weights = _generate_size_weights(num_orders, distribution, scale, side)
+
+        # Compute quantities and values
         if total_value is not None:
-            value_per_order = total_value / num_orders
-            order_specs = [(i, value_per_order / price, price) for i, price in enumerate(prices, 1)]
-            print(f"\nPlacing {num_orders} tiered {side} orders:")
-            print(f"Price range: ${price_low:.4f} - ${price_high:.4f}")
-            print(f"Total value: ${total_value:.2f} (${value_per_order:.2f} per order)\n")
+            tv = Decimal(str(total_value))
+            # value_i = total_value * w_i;  qty_i = value_i / price_i
+            values = [tv * w for w in weights]
+            quantities = [v / p for v, p in zip(values, prices)]
+            total_v = tv
+            total_q = sum(quantities, Decimal(0))
         else:
-            quantity_per_order = total_quantity / num_orders
-            order_specs = [(i, quantity_per_order, price) for i, price in enumerate(prices, 1)]
-            print(f"\nPlacing {num_orders} tiered {side} orders:")
-            print(f"Price range: ${price_low:.4f} - ${price_high:.4f}")
-            print(f"Total quantity: {total_quantity:.4f} ({quantity_per_order:.4f} per order)\n")
+            tq = Decimal(str(total_quantity))
+            # qty_i = total_quantity * w_i
+            quantities = [tq * w for w in weights]
+            values = [q * p for q, p in zip(quantities, prices)]
+            total_q = tq
+            total_v = sum(values, Decimal(0))
 
-        # Place orders in parallel (rate limiter in API client handles spacing)
+        avg_fill = total_v / total_q if total_q > 0 else Decimal(0)
+
+        # Safety rail: dust rungs may hit exchange minimum notional
+        min_rung_value = min(values)
+        if min_rung_value < Decimal(1):
+            warnings.append(
+                f"Smallest rung is ${float(min_rung_value):.4f} — may fall below "
+                f"the exchange minimum notional and fail"
+            )
+
+        return TierPlan(
+            symbol=symbol,
+            side=side,
+            distribution=distribution,
+            size_scale=scale,
+            num_orders=num_orders,
+            price_low=low,
+            price_high=high,
+            prices=prices,
+            quantities=quantities,
+            values=values,
+            total_value=total_v,
+            total_quantity=total_q,
+            avg_fill_price=avg_fill,
+            warnings=warnings,
+        )
+
+    def execute_tier_plan(self, plan: TierPlan) -> List[Optional[Order]]:
+        """Execute a pre-computed tier plan in parallel.
+
+        The rate limiter in the API client serializes actual HTTP calls at
+        safe intervals, so it's safe to fan out with up to 5 workers.
+
+        Returns:
+            List of Order objects in rung order (None for failed rungs).
+        """
+        n = plan.num_orders
+        print(
+            f"\nPlacing {n} tiered {plan.side} orders "
+            f"({plan.distribution.value})..."
+        )
+
         results: Dict[int, tuple[Optional[Order], str]] = {}
-        max_workers = min(num_orders, 5)
+        max_workers = min(n, 5)
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(
                     self._place_single_tiered_order,
-                    symbol, side, qty, px, idx, num_orders
-                ): idx
-                for idx, qty, px in order_specs
+                    plan.symbol,
+                    plan.side,
+                    float(qty),
+                    float(px),
+                    i + 1,
+                    n,
+                ): i + 1
+                for i, (px, qty) in enumerate(zip(plan.prices, plan.quantities))
             }
             for future in as_completed(futures):
                 idx, order, msg = future.result()
                 results[idx] = (order, msg)
 
-        # Print results in order
-        orders = []
-        for idx, _qty, _px in order_specs:
-            order, msg = results[idx]
+        # Print in rung order so output is readable
+        orders: List[Optional[Order]] = []
+        for i in range(1, n + 1):
+            order, msg = results[i]
             print(msg)
             orders.append(order)
 
         successful = sum(1 for o in orders if o is not None)
-        print(f"\nPlaced {successful}/{num_orders} orders successfully")
-
+        print(f"\nPlaced {successful}/{n} orders successfully")
         return orders
 
-    def tiered_buy(self, symbol: str, total_value: float, price_low: float,
-                   price_high: float, num_orders: int) -> List[Optional[Order]]:
+    def place_tiered_orders(
+        self,
+        symbol: str,
+        side: str,
+        price_low: float,
+        price_high: float,
+        num_orders: int,
+        total_value: Optional[float] = None,
+        total_quantity: Optional[float] = None,
+        distribution: Distribution = Distribution.GEOMETRIC_PYRAMID,
+        size_scale: float = 1.5,
+    ) -> List[Optional[Order]]:
+        """Build and execute a tiered order plan in one call.
+
+        Convenience wrapper around :meth:`build_tier_plan` +
+        :meth:`execute_tier_plan`. Callers that need to preview the plan or
+        ask for confirmation should call the two methods separately.
+        """
+        plan = self.build_tier_plan(
+            symbol,
+            side,
+            price_low,
+            price_high,
+            num_orders,
+            total_value=total_value,
+            total_quantity=total_quantity,
+            distribution=distribution,
+            size_scale=size_scale,
+        )
+        if plan is None:
+            return []
+        return self.execute_tier_plan(plan)
+
+    def tiered_buy(
+        self,
+        symbol: str,
+        total_value: float,
+        price_low: float,
+        price_high: float,
+        num_orders: int,
+        distribution: Distribution = Distribution.GEOMETRIC_PYRAMID,
+        size_scale: float = 1.5,
+    ) -> List[Optional[Order]]:
         """Place tiered buy orders by total quote-currency value."""
         return self.place_tiered_orders(
-            symbol, "Bid", price_low, price_high, num_orders, total_value=total_value
+            symbol,
+            "Bid",
+            price_low,
+            price_high,
+            num_orders,
+            total_value=total_value,
+            distribution=distribution,
+            size_scale=size_scale,
         )
 
-    def tiered_sell(self, symbol: str, total_quantity: float, price_low: float,
-                    price_high: float, num_orders: int) -> List[Optional[Order]]:
+    def tiered_sell(
+        self,
+        symbol: str,
+        total_quantity: float,
+        price_low: float,
+        price_high: float,
+        num_orders: int,
+        distribution: Distribution = Distribution.GEOMETRIC_PYRAMID,
+        size_scale: float = 1.5,
+    ) -> List[Optional[Order]]:
         """Place tiered sell orders by total base-currency quantity."""
         return self.place_tiered_orders(
-            symbol, "Ask", price_low, price_high, num_orders, total_quantity=total_quantity
+            symbol,
+            "Ask",
+            price_low,
+            price_high,
+            num_orders,
+            total_quantity=total_quantity,
+            distribution=distribution,
+            size_scale=size_scale,
         )

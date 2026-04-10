@@ -14,7 +14,7 @@ from rich.text import Text
 from datetime import datetime
 
 from api.backpack import BackpackClient
-from core.order_manager import OrderManager
+from core.order_manager import OrderManager, Distribution, TierPlan
 from utils.helpers import (
     format_price, format_quantity, format_percentage,
     format_currency, parse_order_input
@@ -441,24 +441,125 @@ class CLI:
         self.refresh_data()
         self.console.input("\nPress Enter to continue...")
 
+    def _prompt_distribution(self) -> tuple[Distribution, float]:
+        """Prompt user for distribution mode and size scale with sensible defaults.
+
+        Returns:
+            Tuple of (Distribution, size_scale_float). size_scale is only
+            meaningful for GEOMETRIC_PYRAMID; it's 1.0 for flat modes.
+        """
+        self.console.print("\n[dim]Distribution modes:[/dim]")
+        self.console.print("[dim]  1 = linear-even       (equal $ gap, equal size)[/dim]")
+        self.console.print("[dim]  2 = geometric-even    (equal % gap, equal size)[/dim]")
+        self.console.print(
+            "[dim]  3 = geometric-pyramid (equal % gap, weighted toward far end) "
+            "[bold]\u2190 recommended for DCA[/bold][/dim]"
+        )
+        choice = self.console.input(
+            "[yellow]Distribution [1/2/3] (default: 3): [/yellow]"
+        ).strip() or "3"
+
+        mode_map = {
+            "1": Distribution.LINEAR_EVEN,
+            "2": Distribution.GEOMETRIC_EVEN,
+            "3": Distribution.GEOMETRIC_PYRAMID,
+        }
+        distribution = mode_map.get(choice, Distribution.GEOMETRIC_PYRAMID)
+
+        size_scale = 1.0
+        if distribution == Distribution.GEOMETRIC_PYRAMID:
+            scale_str = self.console.input(
+                "[yellow]Size scale (1.0=flat, 1.5=mild, 3.0=aggressive; "
+                "default: 1.5): [/yellow]"
+            ).strip()
+            if scale_str:
+                size_scale = float(scale_str)
+                if size_scale < 1.0:
+                    self.console.print(
+                        "[yellow]size_scale clamped to 1.0[/yellow]"
+                    )
+                    size_scale = 1.0
+            else:
+                size_scale = 1.5
+
+        return distribution, size_scale
+
+    def _render_plan_preview(self, plan: TierPlan) -> None:
+        """Render a rich preview of a TierPlan before execution."""
+        range_pct = float((plan.price_high - plan.price_low) / plan.price_low * 100)
+
+        self.console.print("\n[bold]Plan Preview:[/bold]")
+        self.console.print(f"  Symbol:       {plan.symbol}")
+        self.console.print(f"  Side:         {plan.side}")
+        self.console.print(f"  Distribution: {plan.distribution.value}")
+        if plan.distribution == Distribution.GEOMETRIC_PYRAMID:
+            self.console.print(f"  Size scale:   {float(plan.size_scale):.2f}x")
+        self.console.print(
+            f"  Range:        ${float(plan.price_low):.4f} - "
+            f"${float(plan.price_high):.4f} ({range_pct:+.2f}%)"
+        )
+        self.console.print(f"  Orders:       {plan.num_orders}")
+        self.console.print(f"  Total value:  ~${float(plan.total_value):.2f}")
+        self.console.print(f"  Total qty:    ~{float(plan.total_quantity):.4f}")
+        self.console.print(
+            f"  [bold]Avg fill:[/bold]     "
+            f"[bold]${float(plan.avg_fill_price):.4f}[/bold]"
+        )
+
+        # Show per-rung breakdown in a compact table
+        rung_table = Table(
+            title="Rungs",
+            show_header=True,
+            header_style="bold magenta",
+            title_style="dim",
+        )
+        rung_table.add_column("#", justify="right", style="dim")
+        rung_table.add_column("Price", justify="right")
+        rung_table.add_column("Quantity", justify="right")
+        rung_table.add_column("Value", justify="right")
+
+        min_val = min(plan.values)
+        max_val = max(plan.values)
+
+        for i, (px, qty, val) in enumerate(
+            zip(plan.prices, plan.quantities, plan.values), 1
+        ):
+            tag = ""
+            if val == max_val and plan.num_orders > 1:
+                tag = " [green]heaviest[/green]"
+            elif val == min_val and plan.num_orders > 1:
+                tag = " [dim]lightest[/dim]"
+            rung_table.add_row(
+                str(i),
+                f"${float(px):.4f}",
+                f"{float(qty):.6f}",
+                f"${float(val):.2f}{tag}",
+            )
+
+        self.console.print(rung_table)
+
+        # Warnings
+        for warning in plan.warnings:
+            self.console.print(f"[yellow]\u26a0  {warning}[/yellow]")
+
     def handle_tiered_buy(self):
         """Handle tiered buy orders."""
         try:
             self.console.print("[bold cyan]Tiered Buy Orders[/bold cyan]")
             self.console.print(f"Current price: ${format_price(self.current_price)}\n")
 
-            # Get parameters
-            total_value_str = self.console.input("[green]Total value to buy (USD): [/green]")
-            total_value = float(total_value_str.strip())
-
-            price_low_str = self.console.input("[green]Lower price bound: [/green]")
-            price_low = float(price_low_str.strip())
-
-            price_high_str = self.console.input("[green]Upper price bound: [/green]")
-            price_high = float(price_high_str.strip())
-
-            num_orders_str = self.console.input("[green]Number of orders: [/green]")
-            num_orders = int(num_orders_str.strip())
+            total_value = float(
+                self.console.input("[green]Total value to buy (USD): [/green]").strip()
+            )
+            price_low = float(
+                self.console.input("[green]Lower price bound: [/green]").strip()
+            )
+            price_high = float(
+                self.console.input("[green]Upper price bound: [/green]").strip()
+            )
+            num_orders = int(
+                self.console.input("[green]Number of orders: [/green]").strip()
+            )
 
             if total_value <= 0 or price_low <= 0 or price_high <= 0 or num_orders <= 0:
                 self.console.print("[red]All values must be greater than 0[/red]")
@@ -466,30 +567,43 @@ class CLI:
                 return
 
             if price_low >= price_high:
-                self.console.print("[red]Lower price must be less than upper price[/red]")
+                self.console.print(
+                    "[red]Lower price must be less than upper price[/red]"
+                )
                 self.console.input("\nPress Enter to continue...")
                 return
 
-            # Show preview
-            self.console.print(f"\n[bold]Preview:[/bold]")
-            self.console.print(f"Total: ${total_value:.2f}")
-            self.console.print(f"Range: ${price_low:.4f} - ${price_high:.4f}")
-            self.console.print(f"Orders: {num_orders}")
-            self.console.print(f"Per order: ~${total_value/num_orders:.2f}\n")
+            distribution, size_scale = self._prompt_distribution()
 
-            confirm = self.console.input("[yellow]Confirm? (y/n): [/yellow]")
+            plan = self.order_manager.build_tier_plan(
+                self.current_symbol,
+                "Bid",
+                price_low,
+                price_high,
+                num_orders,
+                total_value=total_value,
+                distribution=distribution,
+                size_scale=size_scale,
+            )
+            if plan is None:
+                self.console.print("[red]Failed to build plan[/red]")
+                self.console.input("\nPress Enter to continue...")
+                return
+
+            self._render_plan_preview(plan)
+
+            confirm = self.console.input("\n[yellow]Confirm? (y/n): [/yellow]")
             if confirm.lower() != 'y':
                 self.console.print("[yellow]Cancelled[/yellow]")
                 self.console.input("\nPress Enter to continue...")
                 return
 
-            # Place orders
-            orders = self.order_manager.tiered_buy(
-                self.current_symbol, total_value, price_low, price_high, num_orders
-            )
-
+            orders = self.order_manager.execute_tier_plan(plan)
             successful = sum(1 for o in orders if o is not None)
-            self.console.print(f"\n[bold green]Placed {successful}/{num_orders} orders successfully[/bold green]")
+            self.console.print(
+                f"\n[bold green]Placed {successful}/{num_orders} orders "
+                f"successfully[/bold green]"
+            )
 
         except ValueError:
             self.console.print("[red]Invalid input. Please enter valid numbers.[/red]")
@@ -504,18 +618,20 @@ class CLI:
             self.console.print("[bold magenta]Tiered Sell Orders[/bold magenta]")
             self.console.print(f"Current price: ${format_price(self.current_price)}\n")
 
-            # Get parameters
-            total_quantity_str = self.console.input("[red]Total quantity to sell (SOL): [/red]")
-            total_quantity = float(total_quantity_str.strip())
-
-            price_low_str = self.console.input("[red]Lower price bound: [/red]")
-            price_low = float(price_low_str.strip())
-
-            price_high_str = self.console.input("[red]Upper price bound: [/red]")
-            price_high = float(price_high_str.strip())
-
-            num_orders_str = self.console.input("[red]Number of orders: [/red]")
-            num_orders = int(num_orders_str.strip())
+            total_quantity = float(
+                self.console.input(
+                    "[red]Total quantity to sell (base currency): [/red]"
+                ).strip()
+            )
+            price_low = float(
+                self.console.input("[red]Lower price bound: [/red]").strip()
+            )
+            price_high = float(
+                self.console.input("[red]Upper price bound: [/red]").strip()
+            )
+            num_orders = int(
+                self.console.input("[red]Number of orders: [/red]").strip()
+            )
 
             if total_quantity <= 0 or price_low <= 0 or price_high <= 0 or num_orders <= 0:
                 self.console.print("[red]All values must be greater than 0[/red]")
@@ -523,35 +639,43 @@ class CLI:
                 return
 
             if price_low >= price_high:
-                self.console.print("[red]Lower price must be less than upper price[/red]")
+                self.console.print(
+                    "[red]Lower price must be less than upper price[/red]"
+                )
                 self.console.input("\nPress Enter to continue...")
                 return
 
-            # Calculate approximate average price for total value display
-            avg_price = (price_low + price_high) / 2
-            total_value = total_quantity * avg_price
+            distribution, size_scale = self._prompt_distribution()
 
-            # Show preview
-            self.console.print(f"\n[bold]Preview:[/bold]")
-            self.console.print(f"Total quantity: {total_quantity:.4f} SOL")
-            self.console.print(f"Approx value: ${total_value:.2f} (at avg price ${avg_price:.2f})")
-            self.console.print(f"Range: ${price_low:.4f} - ${price_high:.4f}")
-            self.console.print(f"Orders: {num_orders}")
-            self.console.print(f"Per order: ~{total_quantity/num_orders:.4f} SOL\n")
+            plan = self.order_manager.build_tier_plan(
+                self.current_symbol,
+                "Ask",
+                price_low,
+                price_high,
+                num_orders,
+                total_quantity=total_quantity,
+                distribution=distribution,
+                size_scale=size_scale,
+            )
+            if plan is None:
+                self.console.print("[red]Failed to build plan[/red]")
+                self.console.input("\nPress Enter to continue...")
+                return
 
-            confirm = self.console.input("[yellow]Confirm? (y/n): [/yellow]")
+            self._render_plan_preview(plan)
+
+            confirm = self.console.input("\n[yellow]Confirm? (y/n): [/yellow]")
             if confirm.lower() != 'y':
                 self.console.print("[yellow]Cancelled[/yellow]")
                 self.console.input("\nPress Enter to continue...")
                 return
 
-            # Place orders using total quantity
-            orders = self.order_manager.tiered_sell(
-                self.current_symbol, total_quantity, price_low, price_high, num_orders
-            )
-
+            orders = self.order_manager.execute_tier_plan(plan)
             successful = sum(1 for o in orders if o is not None)
-            self.console.print(f"\n[bold green]Placed {successful}/{num_orders} orders successfully[/bold green]")
+            self.console.print(
+                f"\n[bold green]Placed {successful}/{num_orders} orders "
+                f"successfully[/bold green]"
+            )
 
         except ValueError:
             self.console.print("[red]Invalid input. Please enter valid numbers.[/red]")
