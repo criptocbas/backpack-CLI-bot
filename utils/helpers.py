@@ -64,13 +64,27 @@ def parse_order_input(input_str: str) -> dict:
 
     Returns:
         Dictionary with quantity and optional price
+
+    Raises:
+        ValueError: If the input format is invalid
     """
-    parts = input_str.strip().split("@")
+    stripped = input_str.strip()
+    if not stripped:
+        raise ValueError("Input is empty. Use format: quantity or quantity@price")
+
+    parts = stripped.split("@")
 
     try:
         quantity = float(parts[0].strip())
-        price = float(parts[1].strip()) if len(parts) > 1 else None
+    except ValueError:
+        raise ValueError(f"Invalid quantity: '{parts[0].strip()}'. Must be a number")
 
-        return {"quantity": quantity, "price": price}
-    except (ValueError, IndexError):
-        return {"quantity": 0, "price": None}
+    if len(parts) > 1:
+        try:
+            price = float(parts[1].strip())
+        except ValueError:
+            raise ValueError(f"Invalid price: '{parts[1].strip()}'. Must be a number")
+    else:
+        price = None
+
+    return {"quantity": quantity, "price": price}

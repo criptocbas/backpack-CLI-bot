@@ -2,6 +2,7 @@
 
 import time
 import base64
+import threading
 import requests
 from typing import Dict, List, Optional, Any
 from urllib.parse import urlencode
@@ -33,6 +34,22 @@ class BackpackClient:
         })
         # Cache for market specifications (tick size, step size)
         self._market_cache: Dict[str, Dict] = {}
+        self._market_cache_time: Dict[str, float] = {}
+        self._market_cache_ttl = 300  # 5 minutes
+
+        # Rate limiting: track last request time, enforce minimum gap
+        self._last_request_time = 0.0
+        self._min_request_interval = 0.2  # 5 req/s max
+        self._rate_lock = threading.Lock()
+
+        # Retry settings
+        self._max_retries = 3
+        self._retry_backoff_factor = 0.3
+        self._retryable_status_codes = {429, 500, 502, 503, 504}
+
+        # Valid symbols cache
+        self._valid_symbols: Optional[set] = None
+        self._valid_symbols_time: float = 0
 
     def _generate_signature(self, instruction: str, params: Optional[Dict] = None, window: int = 5000) -> tuple[str, str, str]:
         """Generate ED25519 signature for authenticated requests.
@@ -75,9 +92,18 @@ class BackpackClient:
 
         return signature, timestamp, str(window)
 
+    def _wait_for_rate_limit(self):
+        """Enforce minimum interval between API requests."""
+        with self._rate_lock:
+            now = time.time()
+            elapsed = now - self._last_request_time
+            if elapsed < self._min_request_interval:
+                time.sleep(self._min_request_interval - elapsed)
+            self._last_request_time = time.time()
+
     def _request(self, method: str, endpoint: str, params: Optional[Dict] = None, data: Optional[Dict] = None,
                  instruction: Optional[str] = None) -> Dict:
-        """Make HTTP request to Backpack API.
+        """Make HTTP request to Backpack API with rate limiting and retry.
 
         Args:
             method: HTTP method
@@ -90,47 +116,68 @@ class BackpackClient:
             Response JSON data
         """
         url = f"{self.base_url}{endpoint}"
-        headers = {}
+        last_exception = None
 
-        if instruction:
-            # Combine params and data for signature generation
-            signature_params = {}
-            if params:
-                signature_params.update(params)
-            if data:
-                signature_params.update(data)
+        for attempt in range(self._max_retries + 1):
+            # Re-sign on each attempt (timestamp must be fresh)
+            headers = {}
+            if instruction:
+                signature_params = {}
+                if params:
+                    signature_params.update(params)
+                if data:
+                    signature_params.update(data)
 
-            signature, timestamp, window = self._generate_signature(instruction, signature_params if signature_params else None)
-            headers["X-Signature"] = signature
-            headers["X-Timestamp"] = timestamp
-            headers["X-Window"] = window
+                signature, timestamp, window = self._generate_signature(
+                    instruction, signature_params if signature_params else None
+                )
+                headers["X-Signature"] = signature
+                headers["X-Timestamp"] = timestamp
+                headers["X-Window"] = window
 
-        try:
-            response = self.session.request(
-                method=method,
-                url=url,
-                params=params,
-                json=data,
-                headers=headers,
-                timeout=10
-            )
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.HTTPError as e:
-            # Get error message without exposing sensitive data
-            status_code = e.response.status_code if hasattr(e, 'response') else 'unknown'
-            error_msg = f"API request failed with status {status_code}"
+            self._wait_for_rate_limit()
 
-            # Only include response text for non-auth errors to avoid key leakage
             try:
-                if hasattr(e.response, 'text') and e.response.text and status_code != 401:
-                    # Sanitize error message - don't include full response for auth errors
-                    error_msg = f"{error_msg} - {e.response.text[:200]}"
-            except:
-                pass
-            raise Exception(error_msg)
-        except requests.exceptions.RequestException as e:
-            raise Exception(f"API request failed: {str(e)}")
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=data,
+                    headers=headers,
+                    timeout=10
+                )
+                response.raise_for_status()
+                return response.json()
+            except requests.exceptions.HTTPError as e:
+                status_code = e.response.status_code if hasattr(e, 'response') else 0
+
+                # Retry on retryable status codes
+                if status_code in self._retryable_status_codes and attempt < self._max_retries:
+                    delay = self._retry_backoff_factor * (2 ** attempt)
+                    time.sleep(delay)
+                    last_exception = e
+                    continue
+
+                # Build error message without exposing sensitive data
+                error_msg = f"API request failed with status {status_code}"
+                try:
+                    if hasattr(e.response, 'text') and e.response.text and status_code != 401:
+                        error_msg = f"{error_msg} - {e.response.text[:200]}"
+                except Exception:
+                    pass
+                raise Exception(error_msg)
+            except requests.exceptions.ConnectionError as e:
+                # Retry on connection errors
+                if attempt < self._max_retries:
+                    delay = self._retry_backoff_factor * (2 ** attempt)
+                    time.sleep(delay)
+                    last_exception = e
+                    continue
+                raise Exception(f"API connection failed after {self._max_retries + 1} attempts: {str(e)}")
+            except requests.exceptions.RequestException as e:
+                raise Exception(f"API request failed: {str(e)}")
+
+        raise Exception(f"API request failed after {self._max_retries + 1} attempts: {str(last_exception)}")
 
     # Public Endpoints
 
@@ -142,6 +189,35 @@ class BackpackClient:
         """
         return self._request("GET", "/api/v1/markets")
 
+    def get_valid_symbols(self) -> set:
+        """Get the set of valid trading symbols, cached for 5 minutes.
+
+        Returns:
+            Set of valid symbol strings
+        """
+        now = time.time()
+        if self._valid_symbols is not None and (now - self._valid_symbols_time) < self._market_cache_ttl:
+            return self._valid_symbols
+
+        markets = self.get_markets()
+        self._valid_symbols = {m["symbol"] for m in markets if "symbol" in m}
+        self._valid_symbols_time = now
+        return self._valid_symbols
+
+    def is_valid_symbol(self, symbol: str) -> bool:
+        """Check if a symbol is a valid trading pair on the exchange.
+
+        Args:
+            symbol: Trading pair symbol to validate
+
+        Returns:
+            True if valid, False otherwise
+        """
+        try:
+            return symbol in self.get_valid_symbols()
+        except Exception:
+            return False
+
     def get_market(self, symbol: str) -> Dict:
         """Get market information for a specific symbol.
 
@@ -151,13 +227,16 @@ class BackpackClient:
         Returns:
             Market data including filters (tickSize, stepSize, etc.)
         """
-        # Check cache first
+        # Check cache first (with TTL)
         if symbol in self._market_cache:
-            return self._market_cache[symbol]
+            age = time.time() - self._market_cache_time.get(symbol, 0)
+            if age < self._market_cache_ttl:
+                return self._market_cache[symbol]
 
         # Fetch from API and cache
         market_data = self._request("GET", f"/api/v1/market", params={"symbol": symbol})
         self._market_cache[symbol] = market_data
+        self._market_cache_time[symbol] = time.time()
         return market_data
 
     def get_market_precision(self, symbol: str) -> tuple[str, str]:

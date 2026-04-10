@@ -1,10 +1,10 @@
 """Command-line interface for Backpack CLI Bot."""
 
-import os
 import sys
 import threading
 import time
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 from rich.console import Console
 from rich.table import Table
 from rich.layout import Layout
@@ -47,7 +47,8 @@ class CLI:
 
     def clear_screen(self):
         """Clear the terminal screen."""
-        os.system('clear' if os.name != 'nt' else 'cls')
+        sys.stdout.write("\033c")
+        sys.stdout.flush()
 
     def display_header(self) -> Panel:
         """Create header panel.
@@ -184,25 +185,44 @@ class CLI:
             print(f"Error refreshing balances: {e}")
 
     def refresh_data(self, silent=False):
-        """Refresh all data from API.
+        """Refresh all data from API (parallel).
 
         Args:
             silent: If True, don't print error messages (for auto-refresh)
         """
         try:
             with self.refresh_lock:
-                # Refresh balances
-                self.refresh_balances()
+                errors = []
 
-                # Refresh orders
-                self.order_manager.refresh_open_orders()
+                def _refresh_balances():
+                    try:
+                        self.refresh_balances()
+                    except Exception as e:
+                        errors.append(f"balances: {e}")
 
-                # Get current price
-                ticker = self.client.get_ticker(self.current_symbol)
-                self.current_price = float(ticker.get("lastPrice", 0))
+                def _refresh_orders():
+                    try:
+                        self.order_manager.refresh_open_orders()
+                    except Exception as e:
+                        errors.append(f"orders: {e}")
 
-                # Update last refresh time
+                def _refresh_ticker():
+                    try:
+                        ticker = self.client.get_ticker(self.current_symbol)
+                        self.current_price = float(ticker.get("lastPrice", 0))
+                    except Exception as e:
+                        errors.append(f"ticker: {e}")
+
+                with ThreadPoolExecutor(max_workers=3) as executor:
+                    executor.submit(_refresh_balances)
+                    executor.submit(_refresh_orders)
+                    executor.submit(_refresh_ticker)
+
                 self.last_refresh_time = time.time()
+
+                if errors and not silent:
+                    for err in errors:
+                        self.console.print(f"[red]Refresh error ({err})[/red]")
 
         except Exception as e:
             if not silent:
@@ -405,13 +425,20 @@ class CLI:
         new_symbol = self.console.input("[yellow]Enter new symbol (e.g., BTC_USDC): [/yellow]")
         new_symbol = new_symbol.strip().upper()
 
-        if "_" in new_symbol:
-            self.current_symbol = new_symbol
-            self.console.print(f"[green]Symbol changed to {self.current_symbol}[/green]")
-            self.refresh_data()
-        else:
+        if "_" not in new_symbol:
             self.console.print("[red]Invalid symbol format. Use format: BASE_QUOTE[/red]")
+            self.console.input("\nPress Enter to continue...")
+            return
 
+        self.console.print(f"[dim]Validating {new_symbol}...[/dim]")
+        if not self.client.is_valid_symbol(new_symbol):
+            self.console.print(f"[red]'{new_symbol}' is not a valid trading pair on Backpack Exchange[/red]")
+            self.console.input("\nPress Enter to continue...")
+            return
+
+        self.current_symbol = new_symbol
+        self.console.print(f"[green]Symbol changed to {self.current_symbol}[/green]")
+        self.refresh_data()
         self.console.input("\nPress Enter to continue...")
 
     def handle_tiered_buy(self):
@@ -518,8 +545,8 @@ class CLI:
                 self.console.input("\nPress Enter to continue...")
                 return
 
-            # Place orders using total quantity instead of total value
-            orders = self.order_manager.tiered_sell_by_quantity(
+            # Place orders using total quantity
+            orders = self.order_manager.tiered_sell(
                 self.current_symbol, total_quantity, price_low, price_high, num_orders
             )
 
