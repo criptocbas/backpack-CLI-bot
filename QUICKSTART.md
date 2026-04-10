@@ -1,11 +1,16 @@
 # Quick Start Guide
 
-Get up and running with Ichibot for Backpack in 5 minutes!
+Get up and running with Backpack CLI Bot in 5 minutes.
 
 ## Step 1: Install Dependencies (1 minute)
 
 ```bash
-cd /home/cbas/Programming/ichibot
+git clone https://github.com/criptocbas/backpack-CLI-bot.git
+cd backpack-CLI-bot
+
+python -m venv venv
+source venv/bin/activate
+
 pip install -r requirements.txt
 ```
 
@@ -42,13 +47,17 @@ python main.py
 
 ## Essential Commands
 
-- `b` - Buy at market price
-- `s` - Sell at market price
-- `l` - Place limit buy order (enter as `quantity@price`, e.g., `1@100`)
-- `k` - Place limit sell order
-- `p` - Refresh positions
-- `r` - Refresh all data
-- `q` - Quit
+- `b` / `s` — market buy / sell
+- `l` / `k` — limit buy / sell (enter as `quantity@price`, e.g. `1@100`)
+- `tb` / `ts` — **tiered buy / sell** (DCA ladder across a price range)
+- `c` — cancel all open orders for the current symbol
+- `cr` — cancel orders in a price range
+- `r` — refresh all data
+- `q` — quit
+
+See the [README](README.md#command-reference) for the full command list and the
+[tiered orders section](README.md#tiered-orders-the-flagship-feature) for DCA
+ladder examples.
 
 ## Pro Tips
 

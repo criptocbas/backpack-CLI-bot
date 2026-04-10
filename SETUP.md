@@ -8,19 +8,16 @@
 
 ## Installation Steps
 
-### 1. Clone or download the project
+### 1. Clone the repository
 
 ```bash
-cd /home/cbas/Programming/ichibot
+git clone https://github.com/criptocbas/backpack-CLI-bot.git
+cd backpack-CLI-bot
 ```
 
 ### 2. Install dependencies
 
-```bash
-pip install -r requirements.txt
-```
-
-Or using a virtual environment (recommended):
+Using a virtual environment (recommended):
 
 ```bash
 python -m venv venv
@@ -54,11 +51,20 @@ BACKPACK_API_SECRET=your_api_secret_here
 
 ### 5. Test the connection
 
+Verify your credentials without placing any orders:
+
+```bash
+python test_connection.py
+```
+
+All four checks (config, public ticker, authenticated account, order book)
+must pass. Then launch the bot:
+
 ```bash
 python main.py
 ```
 
-If everything is configured correctly, you should see the Ichibot dashboard.
+If everything is configured correctly, you should see the trading dashboard.
 
 ## Configuration Options
 
