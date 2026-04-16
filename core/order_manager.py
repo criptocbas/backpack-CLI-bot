@@ -126,11 +126,14 @@ class Order:
         self.symbol = order_data.get("symbol")
         self.side = order_data.get("side")
         self.order_type = order_data.get("orderType")
-        self.price = Decimal(str(order_data.get("price", 0)))
-        self.quantity = Decimal(str(order_data.get("quantity", 0)))
-        self.filled_quantity = Decimal(str(order_data.get("executedQuantity", 0)))
+        self.price = Decimal(str(order_data.get("price") or 0))
+        self.quantity = Decimal(str(order_data.get("quantity") or 0))
+        self.filled_quantity = Decimal(str(order_data.get("executedQuantity") or 0))
+        self.executed_quote_quantity = Decimal(
+            str(order_data.get("executedQuoteQuantity") or 0)
+        )
         self.status = order_data.get("status")
-        self.timestamp = order_data.get("timestamp")
+        self.created_at = order_data.get("createdAt")
 
     @property
     def remaining_quantity(self) -> Decimal:
