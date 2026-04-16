@@ -264,6 +264,38 @@ class BackpackClient:
             # Default fallback values
             return "0.01", "0.01"
 
+    def get_market_limits(self, symbol: str) -> Dict[str, Optional[Decimal]]:
+        """Return the exchange-enforced price/quantity limits for a symbol.
+
+        Keys: ``tick_size``, ``step_size``, ``min_price``, ``max_price``,
+        ``min_quantity``, ``max_quantity``. Missing fields come back as None
+        (max_* are optional in Backpack's schema). Everything that is
+        present is returned as Decimal.
+        """
+        out: Dict[str, Optional[Decimal]] = {
+            "tick_size": None, "step_size": None,
+            "min_price": None, "max_price": None,
+            "min_quantity": None, "max_quantity": None,
+        }
+        try:
+            market = self.get_market(symbol)
+            filters = market.get("filters", {})
+            price = filters.get("price", {}) or {}
+            qty = filters.get("quantity", {}) or {}
+
+            def _dec(v):
+                return Decimal(str(v)) if v is not None else None
+
+            out["tick_size"] = _dec(price.get("tickSize")) or Decimal("0.01")
+            out["step_size"] = _dec(qty.get("stepSize")) or Decimal("0.01")
+            out["min_price"] = _dec(price.get("minPrice"))
+            out["max_price"] = _dec(price.get("maxPrice"))
+            out["min_quantity"] = _dec(qty.get("minQuantity"))
+            out["max_quantity"] = _dec(qty.get("maxQuantity"))
+        except Exception:
+            pass
+        return out
+
     def round_to_precision(self, value, precision: str, rounding=ROUND_DOWN) -> str:
         """Round a value to match exchange precision.
 

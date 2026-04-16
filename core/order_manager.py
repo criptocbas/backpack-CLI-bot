@@ -495,12 +495,47 @@ class OrderManager:
 
         avg_fill = total_v / total_q if total_q > 0 else Decimal(0)
 
-        # Safety rail: dust rungs may hit exchange minimum notional
+        # Safety rail: enforce exchange-side limits up front so the plan can
+        # only be built if every rung will be acceptable to the matching
+        # engine. This avoids the fail-after-partial-placement footgun where
+        # the first N-1 rungs go in and the last one is rejected.
+        try:
+            limits = self.client.get_market_limits(symbol)
+        except Exception:
+            limits = {}
+
+        min_quantity = limits.get("min_quantity")
+        min_price = limits.get("min_price")
+        max_price = limits.get("max_price")
+        step_size = limits.get("step_size")
+
+        min_qty_rung = min(quantities)
+        if min_quantity is not None and min_qty_rung < min_quantity:
+            print(
+                f"Smallest rung qty {min_qty_rung} is below exchange "
+                f"minQuantity {min_quantity} for {symbol} — increase "
+                f"total or reduce number of orders"
+            )
+            return None
+        if step_size is not None and step_size > 0 and min_qty_rung < step_size:
+            print(
+                f"Smallest rung qty {min_qty_rung} is below step size "
+                f"{step_size} — it will round down to zero"
+            )
+            return None
+        if min_price is not None and low < min_price:
+            print(f"Lower price {low} is below exchange minPrice {min_price}")
+            return None
+        if max_price is not None and high > max_price:
+            print(f"Upper price {high} exceeds exchange maxPrice {max_price}")
+            return None
+
+        # Soft signal: still surface dust warnings for visibility
         min_rung_value = min(values)
         if min_rung_value < Decimal(1):
             warnings.append(
-                f"Smallest rung is ${float(min_rung_value):.4f} — may fall below "
-                f"the exchange minimum notional and fail"
+                f"Smallest rung is ${float(min_rung_value):.4f} — may incur "
+                f"disproportionate fees"
             )
 
         return TierPlan(
