@@ -2,6 +2,7 @@
 
 import time
 import base64
+import random
 import threading
 import requests
 from typing import Dict, List, Optional, Any, Union
@@ -45,6 +46,7 @@ class BackpackClient:
         # Retry settings
         self._max_retries = 3
         self._retry_backoff_factor = 0.3
+        self._retry_backoff_cap = 10.0  # hard cap on any single sleep
         self._retryable_status_codes = {429, 500, 502, 503, 504}
 
         # Valid symbols cache
@@ -101,6 +103,29 @@ class BackpackClient:
                 time.sleep(self._min_request_interval - elapsed)
             self._last_request_time = time.time()
 
+    def _compute_backoff(self, attempt: int, retry_after: Optional[float] = None) -> float:
+        """Exponential backoff with jitter, capped. Honors Retry-After if given."""
+        if retry_after is not None:
+            # Server told us how long to wait — honor it (capped to avoid
+            # pathological values), plus a small jitter to avoid a stampede.
+            return min(retry_after, self._retry_backoff_cap) + random.uniform(0, 0.2)
+        raw = self._retry_backoff_factor * (2 ** attempt)
+        jitter = random.uniform(0, self._retry_backoff_factor)
+        return min(raw + jitter, self._retry_backoff_cap)
+
+    @staticmethod
+    def _parse_retry_after(resp) -> Optional[float]:
+        """Parse a Retry-After header (seconds form) into a float, or None."""
+        if resp is None:
+            return None
+        try:
+            raw = resp.headers.get("Retry-After")
+            if raw is None:
+                return None
+            return float(raw)
+        except (ValueError, AttributeError):
+            return None
+
     def _request(self, method: str, endpoint: str, params: Optional[Dict] = None, data: Optional[Dict] = None,
                  instruction: Optional[str] = None) -> Dict:
         """Make HTTP request to Backpack API with rate limiting and retry.
@@ -116,7 +141,7 @@ class BackpackClient:
             Response JSON data
         """
         url = f"{self.base_url}{endpoint}"
-        last_exception = None
+        last_exception: Optional[Exception] = None
 
         for attempt in range(self._max_retries + 1):
             # Re-sign on each attempt (timestamp must be fresh)
@@ -153,8 +178,8 @@ class BackpackClient:
 
                 # Retry on retryable status codes
                 if status_code in self._retryable_status_codes and attempt < self._max_retries:
-                    delay = self._retry_backoff_factor * (2 ** attempt)
-                    time.sleep(delay)
+                    retry_after = self._parse_retry_after(getattr(e, "response", None))
+                    time.sleep(self._compute_backoff(attempt, retry_after))
                     last_exception = e
                     continue
 
@@ -166,14 +191,17 @@ class BackpackClient:
                 except Exception:
                     pass
                 raise Exception(error_msg)
-            except requests.exceptions.ConnectionError as e:
-                # Retry on connection errors
+            except (requests.exceptions.ConnectionError,
+                    requests.exceptions.Timeout,
+                    requests.exceptions.ChunkedEncodingError) as e:
+                # Transient network issues — retry with backoff
                 if attempt < self._max_retries:
-                    delay = self._retry_backoff_factor * (2 ** attempt)
-                    time.sleep(delay)
+                    time.sleep(self._compute_backoff(attempt))
                     last_exception = e
                     continue
-                raise Exception(f"API connection failed after {self._max_retries + 1} attempts: {str(e)}")
+                raise Exception(
+                    f"API network error after {self._max_retries + 1} attempts: {str(e)}"
+                )
             except requests.exceptions.RequestException as e:
                 raise Exception(f"API request failed: {str(e)}")
 
