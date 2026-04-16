@@ -265,18 +265,85 @@ class CLI:
         # Display help
         self.console.print(self.display_help())
 
-    def handle_buy_market(self):
-        """Handle market buy order."""
-        try:
-            quantity_str = self.console.input("[green]Enter quantity to buy: [/green]")
-            input_data = parse_order_input(quantity_str)
-            quantity: Decimal = input_data["quantity"]
+    def _split_symbol(self) -> tuple[str, str]:
+        """Return (base, quote) for self.current_symbol."""
+        parts = self.current_symbol.split("_", 1)
+        if len(parts) != 2:
+            return self.current_symbol, ""
+        return parts[0], parts[1]
 
-            if quantity <= 0:
-                self.console.print("[red]Invalid quantity[/red]")
+    def _free_balance(self, asset: str) -> Decimal:
+        """Free (available) balance for an asset, as Decimal. Zero if unknown."""
+        bal = self.balances.get(asset)
+        if not bal:
+            return Decimal(0)
+        return Decimal(str(bal.get("free", 0)))
+
+    def _confirm(self, prompt: str) -> bool:
+        """Explicit yes/no confirmation — accepts only 'y' / 'yes'."""
+        answer = self.console.input(f"[yellow]{prompt} (y/n): [/yellow]").strip().lower()
+        return answer in ("y", "yes")
+
+    def _parse_market_amount(self, raw: str) -> tuple[Optional[Decimal], Optional[Decimal]]:
+        """Parse a market-order amount prompt.
+
+        A leading '$' or a trailing 'q' means "this is quote currency"
+        (quoteQuantity) — e.g. '$100' or '100q' for "spend 100 USDC".
+        Otherwise the value is treated as a base-asset quantity.
+
+        Returns (base_quantity, quote_quantity) — exactly one is non-None.
+        """
+        s = raw.strip()
+        if not s:
+            raise ValueError("Amount is empty")
+        if s.startswith("$"):
+            return None, _dec(s[1:], "amount")
+        if s.endswith(("q", "Q")):
+            return None, _dec(s[:-1], "amount")
+        return _dec(s, "quantity"), None
+
+    def handle_buy_market(self):
+        """Handle market buy order (accepts base qty or '$<quote>' / '<quote>q')."""
+        try:
+            base, quote = self._split_symbol()
+            self.console.print(
+                f"[dim]Enter a base quantity (e.g. 1.5) or a quote amount "
+                f"(e.g. $100 or 100q to spend {quote or 'quote'}).[/dim]"
+            )
+            raw = self.console.input("[green]Buy amount: [/green]")
+            qty, quote_qty = self._parse_market_amount(raw)
+
+            if (qty is not None and qty <= 0) or (quote_qty is not None and quote_qty <= 0):
+                self.console.print("[red]Amount must be greater than 0[/red]")
                 return
 
-            order = self.order_manager.buy_market(self.current_symbol, quantity=quantity)
+            # Preflight: balance check against the quote asset
+            free_quote = self._free_balance(quote)
+            need_quote = (
+                quote_qty if quote_qty is not None
+                else (qty * self.current_price if self.current_price else None)
+            )
+            if need_quote is not None and quote and free_quote < need_quote:
+                self.console.print(
+                    f"[red]Insufficient {quote} balance: "
+                    f"have {free_quote}, need ~{need_quote}[/red]"
+                )
+                return
+
+            # Confirmation
+            if quote_qty is not None:
+                summary = f"MARKET BUY spending {quote_qty} {quote or 'quote'} of {base or self.current_symbol}"
+            else:
+                est = f" (~${qty * self.current_price:.2f})" if self.current_price else ""
+                summary = f"MARKET BUY {qty} {base or 'base'}{est}"
+            self.console.print(f"\n[bold]{summary}[/bold]")
+            if not self._confirm("Place this order?"):
+                self.console.print("[yellow]Cancelled[/yellow]")
+                return
+
+            order = self.order_manager.buy_market(
+                self.current_symbol, quantity=qty, quote_quantity=quote_qty
+            )
             if order:
                 self.console.print(f"[green]Market buy order placed: {order}[/green]")
             else:
@@ -288,17 +355,51 @@ class CLI:
         self.console.input("\nPress Enter to continue...")
 
     def handle_sell_market(self):
-        """Handle market sell order."""
+        """Handle market sell order (accepts base qty or '$<quote>' / '<quote>q')."""
         try:
-            quantity_str = self.console.input("[red]Enter quantity to sell: [/red]")
-            input_data = parse_order_input(quantity_str)
-            quantity: Decimal = input_data["quantity"]
+            base, quote = self._split_symbol()
+            self.console.print(
+                f"[dim]Enter a base quantity (e.g. 1.5) or a target quote "
+                f"amount (e.g. $100 or 100q) — with quote mode the engine "
+                f"fills up to that notional.[/dim]"
+            )
+            raw = self.console.input("[red]Sell amount: [/red]")
+            qty, quote_qty = self._parse_market_amount(raw)
 
-            if quantity <= 0:
-                self.console.print("[red]Invalid quantity[/red]")
+            if (qty is not None and qty <= 0) or (quote_qty is not None and quote_qty <= 0):
+                self.console.print("[red]Amount must be greater than 0[/red]")
                 return
 
-            order = self.order_manager.sell_market(self.current_symbol, quantity=quantity)
+            # Preflight: for base-qty sells we can compare directly.
+            # For quote-qty sells we conservatively check base >= quote/price.
+            free_base = self._free_balance(base)
+            if qty is not None:
+                need_base = qty
+            elif self.current_price and self.current_price > 0:
+                need_base = quote_qty / self.current_price
+            else:
+                need_base = None
+
+            if need_base is not None and base and free_base < need_base:
+                self.console.print(
+                    f"[red]Insufficient {base} balance: "
+                    f"have {free_base}, need ~{need_base}[/red]"
+                )
+                return
+
+            if quote_qty is not None:
+                summary = f"MARKET SELL to receive ~{quote_qty} {quote or 'quote'} of {base or self.current_symbol}"
+            else:
+                est = f" (~${qty * self.current_price:.2f})" if self.current_price else ""
+                summary = f"MARKET SELL {qty} {base or 'base'}{est}"
+            self.console.print(f"\n[bold]{summary}[/bold]")
+            if not self._confirm("Place this order?"):
+                self.console.print("[yellow]Cancelled[/yellow]")
+                return
+
+            order = self.order_manager.sell_market(
+                self.current_symbol, quantity=qty, quote_quantity=quote_qty
+            )
             if order:
                 self.console.print(f"[green]Market sell order placed: {order}[/green]")
             else:
@@ -319,6 +420,16 @@ class CLI:
 
             if quantity <= 0 or price is None or price <= 0:
                 self.console.print("[red]Invalid quantity or price[/red]")
+                return
+
+            base, quote = self._split_symbol()
+            need_quote = quantity * price
+            free_quote = self._free_balance(quote)
+            if quote and free_quote < need_quote:
+                self.console.print(
+                    f"[red]Insufficient {quote} balance: "
+                    f"have {free_quote}, need {need_quote}[/red]"
+                )
                 return
 
             order = self.order_manager.buy_limit(self.current_symbol, quantity, price)
@@ -342,6 +453,15 @@ class CLI:
 
             if quantity <= 0 or price is None or price <= 0:
                 self.console.print("[red]Invalid quantity or price[/red]")
+                return
+
+            base, _quote = self._split_symbol()
+            free_base = self._free_balance(base)
+            if base and free_base < quantity:
+                self.console.print(
+                    f"[red]Insufficient {base} balance: "
+                    f"have {free_base}, need {quantity}[/red]"
+                )
                 return
 
             order = self.order_manager.sell_limit(self.current_symbol, quantity, price)
@@ -589,6 +709,16 @@ class CLI:
                 self.console.input("\nPress Enter to continue...")
                 return
 
+            base, quote = self._split_symbol()
+            free_quote = self._free_balance(quote)
+            if quote and free_quote < total_value:
+                self.console.print(
+                    f"[red]Insufficient {quote} balance: "
+                    f"have {free_quote}, need {total_value}[/red]"
+                )
+                self.console.input("\nPress Enter to continue...")
+                return
+
             distribution, size_scale = self._prompt_distribution()
 
             plan = self.order_manager.build_tier_plan(
@@ -660,6 +790,16 @@ class CLI:
             if price_low >= price_high:
                 self.console.print(
                     "[red]Lower price must be less than upper price[/red]"
+                )
+                self.console.input("\nPress Enter to continue...")
+                return
+
+            base, _quote = self._split_symbol()
+            free_base = self._free_balance(base)
+            if base and free_base < total_quantity:
+                self.console.print(
+                    f"[red]Insufficient {base} balance: "
+                    f"have {free_base}, need {total_quantity}[/red]"
                 )
                 self.console.input("\nPress Enter to continue...")
                 return
