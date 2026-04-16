@@ -3,6 +3,7 @@
 import sys
 import threading
 import time
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 from concurrent.futures import ThreadPoolExecutor
 from rich.console import Console
@@ -22,6 +23,14 @@ from utils.helpers import (
 from config import config
 
 
+def _dec(raw: str, field: str) -> Decimal:
+    """Parse a prompt input into Decimal, raising ValueError with a clear message."""
+    try:
+        return Decimal(raw.strip())
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"Invalid {field}: '{raw}'. Must be a number")
+
+
 class CLI:
     """Command-line interface for trading bot."""
 
@@ -37,7 +46,7 @@ class CLI:
 
         self.current_symbol = config.DEFAULT_SYMBOL
         self.running = False
-        self.current_price = 0.0
+        self.current_price: Optional[Decimal] = None
         self.balances = {}
 
         # Auto-refresh settings
@@ -57,10 +66,10 @@ class CLI:
             Rich Panel with header info
         """
         # Calculate portfolio value from USDC/USDT balances
-        portfolio_value = 0.0
+        portfolio_value = Decimal(0)
         for asset in ["USDC", "USDT"]:
             if asset in self.balances:
-                portfolio_value += self.balances[asset].get("total", 0)
+                portfolio_value += self.balances[asset].get("total", Decimal(0))
 
         # Calculate time since last refresh
         time_since_refresh = int(time.time() - self.last_refresh_time) if self.last_refresh_time > 0 else 0
@@ -70,7 +79,10 @@ class CLI:
         header_text.append(f" | Symbol: ", style="white")
         header_text.append(f"{self.current_symbol}", style="bold yellow")
         header_text.append(f" | Price: ", style="white")
-        header_text.append(f"${format_price(self.current_price)}", style="bold white")
+        if self.current_price is None or self.current_price <= 0:
+            header_text.append("N/A", style="bold red")
+        else:
+            header_text.append(f"${format_price(self.current_price)}", style="bold white")
         header_text.append(f" | Portfolio: ", style="white")
         header_text.append(f"{format_currency(portfolio_value)}", style="bold green")
         header_text.append(f" | Updated: ", style="white")
@@ -165,21 +177,26 @@ class CLI:
         return Panel(help_text, title="Help", border_style="yellow")
 
     def refresh_balances(self):
-        """Refresh account balances from API."""
+        """Refresh account balances from API.
+
+        Backpack returns balances as decimal strings; we store them as
+        Decimal to avoid binary-float drift when they're summed or compared
+        against order sizes.
+        """
         try:
             account_data = self.client.get_account()
             self.balances.clear()
 
             for asset, balance_data in account_data.items():
                 if isinstance(balance_data, dict):
-                    free = float(balance_data.get("available", 0))
-                    locked = float(balance_data.get("locked", 0))
-                    staked = float(balance_data.get("staked", 0))
+                    free = Decimal(str(balance_data.get("available") or 0))
+                    locked = Decimal(str(balance_data.get("locked") or 0))
+                    staked = Decimal(str(balance_data.get("staked") or 0))
                     self.balances[asset] = {
                         "free": free,
                         "locked": locked,
                         "staked": staked,
-                        "total": free + locked + staked
+                        "total": free + locked + staked,
                     }
         except Exception as e:
             print(f"Error refreshing balances: {e}")
@@ -209,7 +226,8 @@ class CLI:
                 def _refresh_ticker():
                     try:
                         ticker = self.client.get_ticker(self.current_symbol)
-                        self.current_price = float(ticker.get("lastPrice", 0))
+                        last = ticker.get("lastPrice")
+                        self.current_price = Decimal(str(last)) if last else None
                     except Exception as e:
                         errors.append(f"ticker: {e}")
 
@@ -252,14 +270,13 @@ class CLI:
         try:
             quantity_str = self.console.input("[green]Enter quantity to buy: [/green]")
             input_data = parse_order_input(quantity_str)
-            quantity = input_data["quantity"]
+            quantity: Decimal = input_data["quantity"]
 
             if quantity <= 0:
                 self.console.print("[red]Invalid quantity[/red]")
                 return
 
-            # Place order
-            order = self.order_manager.buy_market(self.current_symbol, quantity)
+            order = self.order_manager.buy_market(self.current_symbol, quantity=quantity)
             if order:
                 self.console.print(f"[green]Market buy order placed: {order}[/green]")
             else:
@@ -275,14 +292,13 @@ class CLI:
         try:
             quantity_str = self.console.input("[red]Enter quantity to sell: [/red]")
             input_data = parse_order_input(quantity_str)
-            quantity = input_data["quantity"]
+            quantity: Decimal = input_data["quantity"]
 
             if quantity <= 0:
                 self.console.print("[red]Invalid quantity[/red]")
                 return
 
-            # Place order
-            order = self.order_manager.sell_market(self.current_symbol, quantity)
+            order = self.order_manager.sell_market(self.current_symbol, quantity=quantity)
             if order:
                 self.console.print(f"[green]Market sell order placed: {order}[/green]")
             else:
@@ -298,14 +314,13 @@ class CLI:
         try:
             input_str = self.console.input("[cyan]Enter quantity@price (e.g., 10@100.5): [/cyan]")
             input_data = parse_order_input(input_str)
-            quantity = input_data["quantity"]
-            price = input_data["price"]
+            quantity: Decimal = input_data["quantity"]
+            price: Optional[Decimal] = input_data["price"]
 
-            if quantity <= 0 or not price or price <= 0:
+            if quantity <= 0 or price is None or price <= 0:
                 self.console.print("[red]Invalid quantity or price[/red]")
                 return
 
-            # Place order
             order = self.order_manager.buy_limit(self.current_symbol, quantity, price)
             if order:
                 self.console.print(f"[green]Limit buy order placed: {order}[/green]")
@@ -322,14 +337,13 @@ class CLI:
         try:
             input_str = self.console.input("[magenta]Enter quantity@price (e.g., 10@100.5): [/magenta]")
             input_data = parse_order_input(input_str)
-            quantity = input_data["quantity"]
-            price = input_data["price"]
+            quantity: Decimal = input_data["quantity"]
+            price: Optional[Decimal] = input_data["price"]
 
-            if quantity <= 0 or not price or price <= 0:
+            if quantity <= 0 or price is None or price <= 0:
                 self.console.print("[red]Invalid quantity or price[/red]")
                 return
 
-            # Place order
             order = self.order_manager.sell_limit(self.current_symbol, quantity, price)
             if order:
                 self.console.print(f"[green]Limit sell order placed: {order}[/green]")
@@ -362,23 +376,21 @@ class CLI:
             self.console.print(f"[bold yellow]Cancel Orders in Price Range - {self.current_symbol}[/bold yellow]")
             self.console.print(f"Current price: ${format_price(self.current_price)}\n")
 
-            # Get upper price bound
-            upper_str = self.console.input("[yellow]Enter upper price bound: [/yellow]")
-            price_high = float(upper_str.strip())
-
-            # Get lower price bound
+            # Prompt lower first (matches typical UI convention), then upper;
+            # swap automatically if the user enters them the other way round.
             lower_str = self.console.input("[yellow]Enter lower price bound: [/yellow]")
-            price_low = float(lower_str.strip())
+            price_low = _dec(lower_str, "lower price")
+
+            upper_str = self.console.input("[yellow]Enter upper price bound: [/yellow]")
+            price_high = _dec(upper_str, "upper price")
 
             if price_low <= 0 or price_high <= 0:
                 self.console.print("[red]Prices must be greater than 0[/red]")
                 self.console.input("\nPress Enter to continue...")
                 return
 
-            if price_low >= price_high:
-                self.console.print("[red]Lower price must be less than upper price[/red]")
-                self.console.input("\nPress Enter to continue...")
-                return
+            if price_low > price_high:
+                price_low, price_high = price_high, price_low
 
             # Show preview of orders that will be cancelled
             orders_in_range = [
@@ -387,7 +399,10 @@ class CLI:
             ]
 
             if not orders_in_range:
-                self.console.print(f"\n[yellow]No orders found in price range ${price_low:.4f} - ${price_high:.4f}[/yellow]")
+                self.console.print(
+                    f"\n[yellow]No orders found in price range "
+                    f"${price_low:.4f} - ${price_high:.4f}[/yellow]"
+                )
                 self.console.input("\nPress Enter to continue...")
                 return
 
@@ -441,12 +456,12 @@ class CLI:
         self.refresh_data()
         self.console.input("\nPress Enter to continue...")
 
-    def _prompt_distribution(self) -> tuple[Distribution, float]:
+    def _prompt_distribution(self) -> tuple[Distribution, Decimal]:
         """Prompt user for distribution mode and size scale with sensible defaults.
 
         Returns:
-            Tuple of (Distribution, size_scale_float). size_scale is only
-            meaningful for GEOMETRIC_PYRAMID; it's 1.0 for flat modes.
+            (Distribution, size_scale). size_scale is only meaningful for
+            GEOMETRIC_PYRAMID; it's 1.0 for flat modes.
         """
         self.console.print("\n[dim]Distribution modes:[/dim]")
         self.console.print("[dim]  1 = linear-even       (equal $ gap, equal size)[/dim]")
@@ -466,21 +481,19 @@ class CLI:
         }
         distribution = mode_map.get(choice, Distribution.GEOMETRIC_PYRAMID)
 
-        size_scale = 1.0
+        size_scale = Decimal("1.0")
         if distribution == Distribution.GEOMETRIC_PYRAMID:
             scale_str = self.console.input(
                 "[yellow]Size scale (1.0=flat, 1.5=mild, 3.0=aggressive; "
                 "default: 1.5): [/yellow]"
             ).strip()
             if scale_str:
-                size_scale = float(scale_str)
-                if size_scale < 1.0:
-                    self.console.print(
-                        "[yellow]size_scale clamped to 1.0[/yellow]"
-                    )
-                    size_scale = 1.0
+                size_scale = _dec(scale_str, "size scale")
+                if size_scale < Decimal(1):
+                    self.console.print("[yellow]size_scale clamped to 1.0[/yellow]")
+                    size_scale = Decimal("1.0")
             else:
-                size_scale = 1.5
+                size_scale = Decimal("1.5")
 
         return distribution, size_scale
 
@@ -548,14 +561,17 @@ class CLI:
             self.console.print("[bold cyan]Tiered Buy Orders[/bold cyan]")
             self.console.print(f"Current price: ${format_price(self.current_price)}\n")
 
-            total_value = float(
-                self.console.input("[green]Total value to buy (USD): [/green]").strip()
+            total_value = _dec(
+                self.console.input("[green]Total value to buy (USD): [/green]"),
+                "total value",
             )
-            price_low = float(
-                self.console.input("[green]Lower price bound: [/green]").strip()
+            price_low = _dec(
+                self.console.input("[green]Lower price bound: [/green]"),
+                "lower price",
             )
-            price_high = float(
-                self.console.input("[green]Upper price bound: [/green]").strip()
+            price_high = _dec(
+                self.console.input("[green]Upper price bound: [/green]"),
+                "upper price",
             )
             num_orders = int(
                 self.console.input("[green]Number of orders: [/green]").strip()
@@ -618,16 +634,19 @@ class CLI:
             self.console.print("[bold magenta]Tiered Sell Orders[/bold magenta]")
             self.console.print(f"Current price: ${format_price(self.current_price)}\n")
 
-            total_quantity = float(
+            total_quantity = _dec(
                 self.console.input(
                     "[red]Total quantity to sell (base currency): [/red]"
-                ).strip()
+                ),
+                "total quantity",
             )
-            price_low = float(
-                self.console.input("[red]Lower price bound: [/red]").strip()
+            price_low = _dec(
+                self.console.input("[red]Lower price bound: [/red]"),
+                "lower price",
             )
-            price_high = float(
-                self.console.input("[red]Upper price bound: [/red]").strip()
+            price_high = _dec(
+                self.console.input("[red]Upper price bound: [/red]"),
+                "upper price",
             )
             num_orders = int(
                 self.console.input("[red]Number of orders: [/red]").strip()

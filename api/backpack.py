@@ -4,11 +4,11 @@ import time
 import base64
 import threading
 import requests
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Union
 from urllib.parse import urlencode
 from nacl.signing import SigningKey
 from nacl.encoding import Base64Encoder
-from decimal import Decimal, ROUND_DOWN
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 
 class BackpackClient:
@@ -264,25 +264,31 @@ class BackpackClient:
             # Default fallback values
             return "0.01", "0.01"
 
-    def round_to_precision(self, value: float, precision: str) -> str:
+    def round_to_precision(self, value, precision: str, rounding=ROUND_DOWN) -> str:
         """Round a value to match exchange precision.
 
         Args:
-            value: Value to round
+            value: Value to round (Decimal, float, or int — Decimal preferred)
             precision: Precision string (e.g., "0.01" for 2 decimals)
+            rounding: Decimal rounding mode (default ROUND_DOWN — safe for
+                quantities and buy prices; use ROUND_UP for sell prices so
+                the rounded ask stays above the user's target)
 
         Returns:
             Rounded value as string
         """
-        # Convert to Decimal for precise rounding
-        value_decimal = Decimal(str(value))
+        if isinstance(value, Decimal):
+            value_decimal = value
+        else:
+            value_decimal = Decimal(str(value))
         precision_decimal = Decimal(precision)
 
-        # Round down to nearest precision increment
-        rounded = (value_decimal / precision_decimal).quantize(Decimal('1'), rounding=ROUND_DOWN) * precision_decimal
+        rounded = (value_decimal / precision_decimal).quantize(
+            Decimal('1'), rounding=rounding
+        ) * precision_decimal
 
         # Format as string, removing trailing zeros
-        result = str(rounded)
+        result = format(rounded, 'f')
         if '.' in result:
             result = result.rstrip('0').rstrip('.')
 
@@ -365,44 +371,62 @@ class BackpackClient:
             "orderId": order_id
         }, instruction="orderQuery")
 
-    def place_order(self, symbol: str, side: str, order_type: str, quantity: float,
-                   price: Optional[float] = None, time_in_force: str = "GTC",
-                   client_order_id: Optional[str] = None) -> Dict:
+    def place_order(self, symbol: str, side: str, order_type: str,
+                   quantity: Optional[Any] = None,
+                   price: Optional[Any] = None,
+                   quote_quantity: Optional[Any] = None,
+                   time_in_force: str = "GTC",
+                   client_order_id: Optional[int] = None) -> Dict:
         """Place a new order.
 
         Args:
             symbol: Trading pair symbol
             side: Order side ("Bid" for buy, "Ask" for sell)
             order_type: Order type ("Limit" or "Market")
-            quantity: Order quantity
-            price: Order price (required for limit orders)
+            quantity: Base-asset quantity (Decimal preferred, float/int accepted).
+                Required for limit orders; optional for market orders if
+                ``quote_quantity`` is given instead.
+            price: Limit price (Decimal preferred). Ignored for market orders.
+                For sell limit orders it is rounded UP to the tick so the
+                resulting ask is never below the user's target; for buy limit
+                and all quantities, it is rounded DOWN.
+            quote_quantity: Quote-asset amount for market orders (e.g. "spend
+                $100"). Only valid when ``order_type == "Market"``.
             time_in_force: Time in force (GTC, IOC, FOK)
-            client_order_id: Optional client order ID
+            client_order_id: Optional client order ID (uint32 per Backpack API)
 
         Returns:
             Order response
         """
-        # Get market precision for this symbol
+        if quantity is None and quote_quantity is None:
+            raise ValueError("Must provide quantity or quote_quantity")
+        if quote_quantity is not None and order_type != "Market":
+            raise ValueError("quote_quantity is only valid for Market orders")
+
         tick_size, step_size = self.get_market_precision(symbol)
 
-        # Round quantity to step size
-        quantity_str = self.round_to_precision(quantity, step_size)
-
-        data = {
+        data: Dict[str, Any] = {
             "symbol": symbol,
             "side": side,
             "orderType": order_type,
-            "quantity": quantity_str,
-            "timeInForce": time_in_force
+            "timeInForce": time_in_force,
         }
 
-        if price is not None:
-            # Round price to tick size
-            price_str = self.round_to_precision(price, tick_size)
-            data["price"] = price_str
+        if quantity is not None:
+            data["quantity"] = self.round_to_precision(quantity, step_size)
+        if quote_quantity is not None:
+            # Quote-currency amounts round to tick size (USDC tick is tight).
+            data["quoteQuantity"] = self.round_to_precision(quote_quantity, tick_size)
 
-        if client_order_id:
-            data["clientId"] = client_order_id
+        if price is not None:
+            # Sell limit: round price UP so the rounded ask is never below
+            # the user's target. Buy limit: round DOWN so the rounded bid
+            # is never above the user's target.
+            rounding = ROUND_UP if side == "Ask" else ROUND_DOWN
+            data["price"] = self.round_to_precision(price, tick_size, rounding=rounding)
+
+        if client_order_id is not None:
+            data["clientId"] = int(client_order_id)
 
         return self._request("POST", "/api/v1/order", data=data, instruction="orderExecute")
 

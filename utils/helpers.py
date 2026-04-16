@@ -1,72 +1,54 @@
 """Utility helper functions."""
 
+from decimal import Decimal, InvalidOperation
+from typing import Optional, Union
 
-def format_price(price: float, decimals: int = 4) -> str:
-    """Format price for display.
-
-    Args:
-        price: Price value
-        decimals: Number of decimal places
-
-    Returns:
-        Formatted price string
-    """
-    return f"{price:.{decimals}f}"
+Number = Union[Decimal, float, int]
 
 
-def format_quantity(quantity: float, decimals: int = 4) -> str:
-    """Format quantity for display.
-
-    Args:
-        quantity: Quantity value
-        decimals: Number of decimal places
-
-    Returns:
-        Formatted quantity string
-    """
-    return f"{quantity:.{decimals}f}"
+def _to_float(value: Number) -> float:
+    """Accept Decimal, float, or int and return a float for string formatting."""
+    return float(value)
 
 
-def format_percentage(value: float, decimals: int = 2) -> str:
-    """Format percentage for display.
-
-    Args:
-        value: Percentage value
-        decimals: Number of decimal places
-
-    Returns:
-        Formatted percentage string
-    """
-    return f"{value:.{decimals}f}%"
+def format_price(price: Number, decimals: int = 4) -> str:
+    """Format price for display."""
+    return f"{_to_float(price):.{decimals}f}"
 
 
-def format_currency(value: float, currency: str = "$", decimals: int = 2) -> str:
-    """Format currency value for display.
+def format_quantity(quantity: Number, decimals: int = 4) -> str:
+    """Format quantity for display."""
+    return f"{_to_float(quantity):.{decimals}f}"
 
-    Args:
-        value: Currency value
-        currency: Currency symbol
-        decimals: Number of decimal places
 
-    Returns:
-        Formatted currency string
-    """
-    return f"{currency}{value:,.{decimals}f}"
+def format_percentage(value: Number, decimals: int = 2) -> str:
+    """Format percentage for display."""
+    return f"{_to_float(value):.{decimals}f}%"
+
+
+def format_currency(value: Number, currency: str = "$", decimals: int = 2) -> str:
+    """Format currency value for display."""
+    return f"{currency}{_to_float(value):,.{decimals}f}"
+
+
+def _parse_decimal(raw: str, field_name: str) -> Decimal:
+    """Parse a user-entered number string into Decimal, or raise a clear ValueError."""
+    try:
+        return Decimal(raw)
+    except (InvalidOperation, ValueError):
+        raise ValueError(f"Invalid {field_name}: '{raw}'. Must be a number")
 
 
 def parse_order_input(input_str: str) -> dict:
-    """Parse order input string.
+    """Parse order input string into Decimals.
 
     Format: "quantity@price" or just "quantity"
 
-    Args:
-        input_str: Input string
-
     Returns:
-        Dictionary with quantity and optional price
+        Dictionary with "quantity" (Decimal) and "price" (Decimal or None).
 
     Raises:
-        ValueError: If the input format is invalid
+        ValueError: If the input format is invalid.
     """
     stripped = input_str.strip()
     if not stripped:
@@ -74,16 +56,10 @@ def parse_order_input(input_str: str) -> dict:
 
     parts = stripped.split("@")
 
-    try:
-        quantity = float(parts[0].strip())
-    except ValueError:
-        raise ValueError(f"Invalid quantity: '{parts[0].strip()}'. Must be a number")
-
+    quantity = _parse_decimal(parts[0].strip(), "quantity")
+    price: Optional[Decimal]
     if len(parts) > 1:
-        try:
-            price = float(parts[1].strip())
-        except ValueError:
-            raise ValueError(f"Invalid price: '{parts[1].strip()}'. Must be a number")
+        price = _parse_decimal(parts[1].strip(), "price")
     else:
         price = None
 

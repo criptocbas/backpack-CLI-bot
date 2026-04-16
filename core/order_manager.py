@@ -167,23 +167,25 @@ class OrderManager:
         self.open_orders: Dict[str, Order] = {}
         self._orders_lock = threading.Lock()
 
-    def place_market_order(self, symbol: str, side: str, quantity: float) -> Optional[Order]:
+    def place_market_order(
+        self,
+        symbol: str,
+        side: str,
+        quantity: Optional[Decimal] = None,
+        quote_quantity: Optional[Decimal] = None,
+    ) -> Optional[Order]:
         """Place a market order.
 
-        Args:
-            symbol: Trading pair symbol
-            side: "Bid" for buy, "Ask" for sell
-            quantity: Order quantity
-
-        Returns:
-            Order object if successful, None otherwise
+        Exactly one of ``quantity`` (base) or ``quote_quantity`` (quote, e.g.
+        "spend $100") must be provided.
         """
         try:
             response = self.client.place_order(
                 symbol=symbol,
                 side=side,
                 order_type="Market",
-                quantity=quantity
+                quantity=quantity,
+                quote_quantity=quote_quantity,
             )
             order = Order(response)
             with self._orders_lock:
@@ -193,19 +195,12 @@ class OrderManager:
             print(f"Error placing market order: {e}")
             return None
 
-    def place_limit_order(self, symbol: str, side: str, quantity: float, price: float,
+    def place_limit_order(self, symbol: str, side: str, quantity: Decimal, price: Decimal,
                          time_in_force: str = "GTC") -> Optional[Order]:
         """Place a limit order.
 
-        Args:
-            symbol: Trading pair symbol
-            side: "Bid" for buy, "Ask" for sell
-            quantity: Order quantity
-            price: Order price
-            time_in_force: Time in force (GTC, IOC, FOK)
-
-        Returns:
-            Order object if successful, None otherwise
+        Quantities and prices should be Decimal; floats are accepted but
+        lose precision at the edge.
         """
         try:
             response = self.client.place_order(
@@ -224,54 +219,30 @@ class OrderManager:
             print(f"Error placing limit order: {e}")
             return None
 
-    def buy_market(self, symbol: str, quantity: float) -> Optional[Order]:
-        """Convenience method for market buy.
+    def buy_market(
+        self,
+        symbol: str,
+        quantity: Optional[Decimal] = None,
+        quote_quantity: Optional[Decimal] = None,
+    ) -> Optional[Order]:
+        """Market buy by base quantity or quote amount (e.g. "spend $100")."""
+        return self.place_market_order(symbol, "Bid", quantity, quote_quantity)
 
-        Args:
-            symbol: Trading pair symbol
-            quantity: Order quantity
+    def sell_market(
+        self,
+        symbol: str,
+        quantity: Optional[Decimal] = None,
+        quote_quantity: Optional[Decimal] = None,
+    ) -> Optional[Order]:
+        """Market sell by base quantity or target quote receipt."""
+        return self.place_market_order(symbol, "Ask", quantity, quote_quantity)
 
-        Returns:
-            Order object if successful
-        """
-        return self.place_market_order(symbol, "Bid", quantity)
-
-    def sell_market(self, symbol: str, quantity: float) -> Optional[Order]:
-        """Convenience method for market sell.
-
-        Args:
-            symbol: Trading pair symbol
-            quantity: Order quantity
-
-        Returns:
-            Order object if successful
-        """
-        return self.place_market_order(symbol, "Ask", quantity)
-
-    def buy_limit(self, symbol: str, quantity: float, price: float) -> Optional[Order]:
-        """Convenience method for limit buy.
-
-        Args:
-            symbol: Trading pair symbol
-            quantity: Order quantity
-            price: Order price
-
-        Returns:
-            Order object if successful
-        """
+    def buy_limit(self, symbol: str, quantity: Decimal, price: Decimal) -> Optional[Order]:
+        """Convenience method for limit buy."""
         return self.place_limit_order(symbol, "Bid", quantity, price)
 
-    def sell_limit(self, symbol: str, quantity: float, price: float) -> Optional[Order]:
-        """Convenience method for limit sell.
-
-        Args:
-            symbol: Trading pair symbol
-            quantity: Order quantity
-            price: Order price
-
-        Returns:
-            Order object if successful
-        """
+    def sell_limit(self, symbol: str, quantity: Decimal, price: Decimal) -> Optional[Order]:
+        """Convenience method for limit sell."""
         return self.place_limit_order(symbol, "Ask", quantity, price)
 
     def cancel_order(self, order_id: str, symbol: str) -> bool:
@@ -314,13 +285,13 @@ class OrderManager:
             print(f"Error canceling all orders: {e}")
             return False
 
-    def cancel_orders_in_price_range(self, symbol: str, price_low: float, price_high: float) -> tuple[int, int]:
+    def cancel_orders_in_price_range(self, symbol: str, price_low, price_high) -> tuple[int, int]:
         """Cancel orders within a specific price range.
 
         Args:
             symbol: Trading pair symbol
-            price_low: Lower price bound
-            price_high: Upper price bound
+            price_low: Lower price bound (Decimal or float)
+            price_high: Upper price bound (Decimal or float)
 
         Returns:
             Tuple of (successful_cancellations, total_orders_in_range)
@@ -328,8 +299,8 @@ class OrderManager:
         # Fetch live orders from the exchange before filtering
         self.refresh_open_orders(symbol)
 
-        low = Decimal(str(price_low))
-        high = Decimal(str(price_high))
+        low = price_low if isinstance(price_low, Decimal) else Decimal(str(price_low))
+        high = price_high if isinstance(price_high, Decimal) else Decimal(str(price_high))
         with self._orders_lock:
             orders_in_range = [
                 order for order in self.open_orders.values()
@@ -342,7 +313,7 @@ class OrderManager:
         successful = 0
         total = len(orders_in_range)
 
-        print(f"\nFound {total} order(s) in price range ${price_low:.4f} - ${price_high:.4f}")
+        print(f"\nFound {total} order(s) in price range ${low:.4f} - ${high:.4f}")
         print("Canceling orders...")
 
         for order in orders_in_range:
@@ -404,8 +375,8 @@ class OrderManager:
         with self._orders_lock:
             return self.open_orders.get(order_id)
 
-    def _place_single_tiered_order(self, symbol: str, side: str, quantity: float,
-                                   price: float, index: int, total: int) -> tuple[int, Optional[Order], str]:
+    def _place_single_tiered_order(self, symbol: str, side: str, quantity: Decimal,
+                                   price: Decimal, index: int, total: int) -> tuple[int, Optional[Order], str]:
         """Place a single order for tiered placement (used by thread pool).
 
         Returns:
@@ -424,13 +395,13 @@ class OrderManager:
         self,
         symbol: str,
         side: str,
-        price_low: float,
-        price_high: float,
+        price_low,
+        price_high,
         num_orders: int,
-        total_value: Optional[float] = None,
-        total_quantity: Optional[float] = None,
+        total_value=None,
+        total_quantity=None,
         distribution: Distribution = Distribution.GEOMETRIC_PYRAMID,
-        size_scale: float = 1.5,
+        size_scale=Decimal("1.5"),
     ) -> Optional[TierPlan]:
         """Compute a tiered order plan without placing any orders.
 
@@ -452,6 +423,9 @@ class OrderManager:
         Returns:
             TierPlan on success, None on invalid input (error printed).
         """
+        def _as_dec(x):
+            return x if isinstance(x, Decimal) else Decimal(str(x))
+
         # Validation
         if (total_value is None) == (total_quantity is None):
             print("Must provide exactly one of total_value or total_quantity")
@@ -459,28 +433,27 @@ class OrderManager:
         if num_orders <= 0:
             print("Number of orders must be greater than 0")
             return None
-        if price_low >= price_high:
+        low = _as_dec(price_low)
+        high = _as_dec(price_high)
+        scale = _as_dec(size_scale)
+        if low >= high:
             print("Lower price must be less than higher price")
             return None
-        if price_low <= 0 or price_high <= 0:
+        if low <= 0 or high <= 0:
             print("Prices must be greater than 0")
             return None
-        if size_scale < 1.0:
+        if scale < Decimal(1):
             print("size_scale must be >= 1.0")
             return None
         if side not in ("Bid", "Ask"):
             print(f"Invalid side: {side} (expected 'Bid' or 'Ask')")
             return None
-        if total_value is not None and total_value <= 0:
+        if total_value is not None and _as_dec(total_value) <= 0:
             print("total_value must be > 0")
             return None
-        if total_quantity is not None and total_quantity <= 0:
+        if total_quantity is not None and _as_dec(total_quantity) <= 0:
             print("total_quantity must be > 0")
             return None
-
-        low = Decimal(str(price_low))
-        high = Decimal(str(price_high))
-        scale = Decimal(str(size_scale))
 
         warnings: List[str] = []
 
@@ -506,14 +479,14 @@ class OrderManager:
 
         # Compute quantities and values
         if total_value is not None:
-            tv = Decimal(str(total_value))
+            tv = _as_dec(total_value)
             # value_i = total_value * w_i;  qty_i = value_i / price_i
             values = [tv * w for w in weights]
             quantities = [v / p for v, p in zip(values, prices)]
             total_v = tv
             total_q = sum(quantities, Decimal(0))
         else:
-            tq = Decimal(str(total_quantity))
+            tq = _as_dec(total_quantity)
             # qty_i = total_quantity * w_i
             quantities = [tq * w for w in weights]
             values = [q * p for q, p in zip(quantities, prices)]
@@ -571,8 +544,8 @@ class OrderManager:
                     self._place_single_tiered_order,
                     plan.symbol,
                     plan.side,
-                    float(qty),
-                    float(px),
+                    qty,
+                    px,
                     i + 1,
                     n,
                 ): i + 1
@@ -597,13 +570,13 @@ class OrderManager:
         self,
         symbol: str,
         side: str,
-        price_low: float,
-        price_high: float,
+        price_low,
+        price_high,
         num_orders: int,
-        total_value: Optional[float] = None,
-        total_quantity: Optional[float] = None,
+        total_value=None,
+        total_quantity=None,
         distribution: Distribution = Distribution.GEOMETRIC_PYRAMID,
-        size_scale: float = 1.5,
+        size_scale=Decimal("1.5"),
     ) -> List[Optional[Order]]:
         """Build and execute a tiered order plan in one call.
 
@@ -629,12 +602,12 @@ class OrderManager:
     def tiered_buy(
         self,
         symbol: str,
-        total_value: float,
-        price_low: float,
-        price_high: float,
+        total_value,
+        price_low,
+        price_high,
         num_orders: int,
         distribution: Distribution = Distribution.GEOMETRIC_PYRAMID,
-        size_scale: float = 1.5,
+        size_scale=Decimal("1.5"),
     ) -> List[Optional[Order]]:
         """Place tiered buy orders by total quote-currency value."""
         return self.place_tiered_orders(
@@ -651,12 +624,12 @@ class OrderManager:
     def tiered_sell(
         self,
         symbol: str,
-        total_quantity: float,
-        price_low: float,
-        price_high: float,
+        total_quantity,
+        price_low,
+        price_high,
         num_orders: int,
         distribution: Distribution = Distribution.GEOMETRIC_PYRAMID,
-        size_scale: float = 1.5,
+        size_scale=Decimal("1.5"),
     ) -> List[Optional[Order]]:
         """Place tiered sell orders by total base-currency quantity."""
         return self.place_tiered_orders(
