@@ -50,15 +50,23 @@ def test_connection():
         print("✓ Authentication successful")
         print(f"  Account data retrieved")
 
-        # Display balances if available
-        balances = account.get("balances", [])
-        if balances:
+        # Backpack returns balances as {asset: {available, locked, staked}}
+        # (decimal strings), not a list under "balances".
+        if isinstance(account, dict) and account:
+            shown = 0
             print(f"\n  Balances:")
-            for balance in balances[:5]:  # Show first 5
-                asset = balance.get("asset")
-                available = float(balance.get("available", 0))
+            for asset, bal in account.items():
+                if not isinstance(bal, dict):
+                    continue
+                try:
+                    available = float(bal.get("available", 0))
+                except (TypeError, ValueError):
+                    continue
                 if available > 0:
                     print(f"    {asset}: {available}")
+                    shown += 1
+                    if shown >= 5:
+                        break
         print()
     except Exception as e:
         print(f"❌ Authentication failed: {e}")
