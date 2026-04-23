@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, List, Optional
 from decimal import Decimal
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
 from api.backpack import BackpackClient
 
 
@@ -561,8 +561,15 @@ class OrderManager:
         The rate limiter in the API client serializes actual HTTP calls at
         safe intervals, so it's safe to fan out with up to 5 workers.
 
+        Fail-fast: on the first rung failure, cancel any rungs that haven't
+        started yet and stop submitting new work. Rungs already in-flight
+        will complete normally. This avoids hammering the API with 29 more
+        requests when the first one reveals a systemic issue (bad signing,
+        insufficient balance, bad precision, etc).
+
         Returns:
-            List of Order objects in rung order (None for failed rungs).
+            List of Order objects in rung order (None for failed or
+            cancelled rungs).
         """
         n = plan.num_orders
         print(
@@ -572,6 +579,7 @@ class OrderManager:
 
         results: Dict[int, tuple[Optional[Order], str]] = {}
         max_workers = min(n, 5)
+        first_error: Optional[str] = None
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
@@ -587,18 +595,36 @@ class OrderManager:
                 for i, (px, qty) in enumerate(zip(plan.prices, plan.quantities))
             }
             for future in as_completed(futures):
-                idx, order, msg = future.result()
+                try:
+                    idx, order, msg = future.result()
+                except CancelledError:
+                    continue
                 results[idx] = (order, msg)
+                if order is None and first_error is None:
+                    first_error = msg.strip()
+                    for f in futures:
+                        f.cancel()
 
-        # Print in rung order so output is readable
         orders: List[Optional[Order]] = []
         for i in range(1, n + 1):
-            order, msg = results[i]
-            print(msg)
-            orders.append(order)
+            if i in results:
+                order, msg = results[i]
+                print(msg)
+                orders.append(order)
+            else:
+                print(f"  Order {i}/{n}: skipped (aborted after earlier failure)")
+                orders.append(None)
 
         successful = sum(1 for o in orders if o is not None)
-        print(f"\nPlaced {successful}/{n} orders successfully")
+        if first_error:
+            attempted = len(results)
+            skipped = n - attempted
+            print(
+                f"\nAborted after first failure: {first_error}\n"
+                f"Placed {successful}/{attempted} attempted, {skipped} skipped."
+            )
+        else:
+            print(f"\nPlaced {successful}/{n} orders successfully")
         return orders
 
     def place_tiered_orders(
