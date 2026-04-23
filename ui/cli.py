@@ -134,11 +134,12 @@ class CLI:
         table.add_column("Asset", style="cyan")
         table.add_column("Free", justify="right", style="green")
         table.add_column("Locked", justify="right", style="yellow")
+        table.add_column("Lent", justify="right", style="magenta")
         table.add_column("Staked", justify="right", style="blue")
         table.add_column("Total", justify="right", style="white")
 
         if not self.balances:
-            table.add_row("No balances", "-", "-", "-", "-")
+            table.add_row("No balances", "-", "-", "-", "-", "-")
         else:
             for asset, balance in self.balances.items():
                 if balance["total"] > 0:  # Only show non-zero balances
@@ -146,6 +147,7 @@ class CLI:
                         asset,
                         format_quantity(balance["free"]),
                         format_quantity(balance["locked"]),
+                        format_quantity(balance.get("lent", 0)),
                         format_quantity(balance.get("staked", 0)),
                         format_quantity(balance["total"])
                     )
@@ -192,12 +194,38 @@ class CLI:
                     free = Decimal(str(balance_data.get("available") or 0))
                     locked = Decimal(str(balance_data.get("locked") or 0))
                     staked = Decimal(str(balance_data.get("staked") or 0))
+                    lent = Decimal(str(balance_data.get("lent") or 0))
                     self.balances[asset] = {
                         "free": free,
                         "locked": locked,
                         "staked": staked,
-                        "total": free + locked + staked,
+                        "lent": lent,
+                        "total": free + locked + staked + lent,
                     }
+
+            # /api/v1/capital reports the spot wallet only; auto-lent
+            # balances live on the collateral endpoint. Merge them in so
+            # the dashboard and preflight see lent SOL/USDC/etc.
+            try:
+                collateral = self.client.get_collateral() or {}
+                for entry in collateral.get("collateral", []) or []:
+                    asset = entry.get("symbol")
+                    if not asset:
+                        continue
+                    lent = Decimal(str(entry.get("lendQuantity") or 0))
+                    if lent <= 0:
+                        continue
+                    bal = self.balances.setdefault(asset, {
+                        "free": Decimal(0),
+                        "locked": Decimal(0),
+                        "staked": Decimal(0),
+                        "lent": Decimal(0),
+                        "total": Decimal(0),
+                    })
+                    bal["lent"] = lent
+                    bal["total"] = bal["free"] + bal["locked"] + bal["staked"] + lent
+            except Exception as e:
+                print(f"Error refreshing collateral: {e}")
         except Exception as e:
             print(f"Error refreshing balances: {e}")
 
@@ -273,11 +301,16 @@ class CLI:
         return parts[0], parts[1]
 
     def _free_balance(self, asset: str) -> Decimal:
-        """Free (available) balance for an asset, as Decimal. Zero if unknown."""
+        """Spendable balance for an asset: available + lent.
+
+        Orders are placed with autoLendRedeem=True, so Backpack will
+        auto-redeem lent balance to fill the order. Count lent funds
+        as spendable for preflight to match the exchange's behavior.
+        """
         bal = self.balances.get(asset)
         if not bal:
             return Decimal(0)
-        return Decimal(str(bal.get("free", 0)))
+        return Decimal(str(bal.get("free", 0))) + Decimal(str(bal.get("lent", 0)))
 
     def _confirm(self, prompt: str) -> bool:
         """Explicit yes/no confirmation — accepts only 'y' / 'yes'."""

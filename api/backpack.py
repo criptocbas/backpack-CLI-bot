@@ -73,10 +73,15 @@ class BackpackClient:
 
         message_parts = [f"instruction={instruction}"]
 
-        # Add parameters if they exist, alphabetically sorted
+        # Add parameters if they exist, alphabetically sorted.
+        # Booleans must match JSON wire format ("true"/"false", not
+        # Python's "True"/"False") or the server-side signature check
+        # will reject the request with INVALID_CLIENT_REQUEST.
         if params:
             sorted_params = sorted(params.items())
             for key, value in sorted_params:
+                if isinstance(value, bool):
+                    value = "true" if value else "false"
                 message_parts.append(f"{key}={value}")
 
         # Append timestamp and window
@@ -404,6 +409,15 @@ class BackpackClient:
         """
         return self._request("GET", "/api/v1/capital", instruction="balanceQuery")
 
+    def get_collateral(self) -> Dict:
+        """Get collateral account state — includes lent balances and
+        per-asset collateral-backed positions not visible on /capital.
+
+        Returns:
+            Collateral payload with ``collateral[]``, ``netEquityAvailable``, etc.
+        """
+        return self._request("GET", "/api/v1/capital/collateral", instruction="collateralQuery")
+
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict]:
         """Get all open orders.
 
@@ -436,7 +450,8 @@ class BackpackClient:
                    price: Optional[Any] = None,
                    quote_quantity: Optional[Any] = None,
                    time_in_force: str = "GTC",
-                   client_order_id: Optional[int] = None) -> Dict:
+                   client_order_id: Optional[int] = None,
+                   auto_lend_redeem: bool = True) -> Dict:
         """Place a new order.
 
         Args:
@@ -487,6 +502,9 @@ class BackpackClient:
 
         if client_order_id is not None:
             data["clientId"] = int(client_order_id)
+
+        if auto_lend_redeem:
+            data["autoLendRedeem"] = True
 
         return self._request("POST", "/api/v1/order", data=data, instruction="orderExecute")
 
