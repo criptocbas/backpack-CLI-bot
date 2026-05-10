@@ -3,10 +3,19 @@
 import threading
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from decimal import Decimal
 from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
 from api.backpack import BackpackClient
+
+
+class Direction(str, Enum):
+    """Direction of a perp position. Maps to a Backpack ``side``:
+    LONG opens with ``Bid``; SHORT opens with ``Ask``.
+    """
+
+    LONG = "long"
+    SHORT = "short"
 
 
 class Distribution(str, Enum):
@@ -110,6 +119,29 @@ class TierPlan:
     total_quantity: Decimal
     avg_fill_price: Decimal
     warnings: List[str] = field(default_factory=list)
+
+
+@dataclass
+class RiskTierPlan:
+    """A tiered perp entry sized so that, if all rungs fill, the loss
+    triggered by the stop-loss equals the user's risk budget exactly.
+
+    Wraps a :class:`TierPlan` with the risk-side inputs (target avg, SL,
+    risk amount) and derived metrics (worst-rung partial-fill loss,
+    notional, distance to SL).
+    """
+
+    direction: Direction
+    target_avg: Decimal
+    sl_price: Decimal
+    risk_amount: Decimal
+    width_pct: Decimal  # half-width around target_avg, e.g. 0.02 = ±2%
+    tier_plan: TierPlan
+    notional: Decimal
+    max_loss_if_all_filled: Decimal  # equals risk_amount by construction
+    max_loss_if_only_worst_rung: Decimal  # if only the worst-priced rung fills
+    distance_to_sl_pct: Decimal  # |actual_avg - sl| / actual_avg
+    avg_drift_pct: Decimal  # (actual_avg - target_avg) / target_avg, signed
 
 
 class Order:
@@ -703,3 +735,219 @@ class OrderManager:
             distribution=distribution,
             size_scale=size_scale,
         )
+
+    def build_risk_tier_plan(
+        self,
+        symbol: str,
+        direction: Direction,
+        target_avg,
+        sl_price,
+        risk_amount,
+        width_pct,
+        num_orders: int,
+        distribution: Distribution = Distribution.LINEAR_EVEN,
+        size_scale=Decimal("1.0"),
+    ) -> Optional[RiskTierPlan]:
+        """Build a perp entry ladder centered on ``target_avg`` and sized
+        so that loss-if-stopped equals ``risk_amount``.
+
+        Width semantics: half-width around ``target_avg`` — the ladder spans
+        ``target_avg × (1 − width_pct)`` to ``target_avg × (1 + width_pct)``,
+        so ``width_pct=0.02`` means ±2% around the target (4% total span).
+
+        The ladder uses the existing ``build_tier_plan`` machinery for
+        prices and weights. Total quantity is back-solved from the *actual*
+        weighted-average fill price (which can drift a few bps from
+        ``target_avg`` under non-flat distributions). Sizing off the actual
+        avg makes risk = ``risk_amount`` exact when all rungs fill.
+
+        Args:
+            symbol: A perp symbol (must end in ``_PERP``).
+            direction: Direction.LONG or Direction.SHORT.
+            target_avg: Desired average entry price.
+            sl_price: Stop-loss price. Must be on the loss side of target_avg.
+            risk_amount: Quote-currency loss budget if SL fires after full fill.
+            width_pct: Half-width as a fraction (0.02 for ±2%).
+            num_orders: Number of rungs.
+            distribution: Price/size distribution mode (defaults to
+                LINEAR_EVEN — keeps actual_avg = target_avg exactly).
+            size_scale: Pyramid scale factor (only meaningful for
+                GEOMETRIC_PYRAMID).
+
+        Returns:
+            RiskTierPlan on success, None on invalid input (error printed).
+        """
+        def _as_dec(x):
+            return x if isinstance(x, Decimal) else Decimal(str(x))
+
+        if not symbol.endswith("_PERP"):
+            print(
+                f"Risk-tier plans are perp-only — '{symbol}' is not a "
+                f"perp symbol. Use a *_PERP market."
+            )
+            return None
+
+        target_avg = _as_dec(target_avg)
+        sl_price = _as_dec(sl_price)
+        risk_amount = _as_dec(risk_amount)
+        width_pct = _as_dec(width_pct)
+        size_scale = _as_dec(size_scale)
+
+        if target_avg <= 0 or sl_price <= 0:
+            print("Prices must be greater than 0")
+            return None
+        if risk_amount <= 0:
+            print("Risk amount must be greater than 0")
+            return None
+        if num_orders <= 0:
+            print("Number of orders must be greater than 0")
+            return None
+        if width_pct <= 0 or width_pct >= Decimal("0.5"):
+            print("width_pct must be in (0, 0.5) — half-width around target_avg")
+            return None
+
+        # SL must be on the loss side of the target avg.
+        if direction == Direction.LONG:
+            if sl_price >= target_avg:
+                print(
+                    f"Long SL {sl_price} must be below target avg {target_avg}"
+                )
+                return None
+            side = "Bid"
+        elif direction == Direction.SHORT:
+            if sl_price <= target_avg:
+                print(
+                    f"Short SL {sl_price} must be above target avg {target_avg}"
+                )
+                return None
+            side = "Ask"
+        else:
+            print(f"Invalid direction: {direction}")
+            return None
+
+        low = target_avg * (Decimal(1) - width_pct)
+        high = target_avg * (Decimal(1) + width_pct)
+
+        # Reject if the worst-priced rung would already be a loss before
+        # the SL even fires.
+        if direction == Direction.LONG and low <= sl_price:
+            print(
+                f"Ladder low {low} crosses SL {sl_price} — reduce width_pct "
+                f"or move SL further from target"
+            )
+            return None
+        if direction == Direction.SHORT and high >= sl_price:
+            print(
+                f"Ladder high {high} crosses SL {sl_price} — reduce width_pct "
+                f"or move SL further from target"
+            )
+            return None
+
+        # Compute the ladder's actual weighted avg, then size total qty
+        # so that Q × |actual_avg - SL| == risk_amount exactly.
+        prices = _generate_prices(low, high, num_orders, distribution)
+        weights = _generate_size_weights(num_orders, distribution, size_scale, side)
+        actual_avg = sum((p * w for p, w in zip(prices, weights)), Decimal(0))
+        distance = abs(actual_avg - sl_price)
+        if distance <= 0:
+            print("Actual average equals SL — distance is zero")
+            return None
+
+        total_qty = risk_amount / distance
+
+        plan = self.build_tier_plan(
+            symbol,
+            side,
+            low,
+            high,
+            num_orders,
+            total_quantity=total_qty,
+            distribution=distribution,
+            size_scale=size_scale,
+        )
+        if plan is None:
+            return None
+
+        # Worst-priced rung = highest price for a long, lowest for a short.
+        worst_idx = num_orders - 1 if direction == Direction.LONG else 0
+        worst_qty = plan.quantities[worst_idx]
+        worst_price = plan.prices[worst_idx]
+        max_loss_worst = worst_qty * abs(worst_price - sl_price)
+
+        avg_drift = (
+            (plan.avg_fill_price - target_avg) / target_avg
+            if target_avg > 0 else Decimal(0)
+        )
+        # Surface drift if the chosen distribution skews actual_avg far
+        # from the user's target. LINEAR_EVEN/flat keeps it at zero.
+        if abs(avg_drift) > Decimal("0.005"):
+            plan.warnings.append(
+                f"Actual avg ${float(plan.avg_fill_price):.4f} drifts "
+                f"{float(avg_drift) * 100:+.2f}% from target "
+                f"${float(target_avg):.4f} — switch to linear-even for an "
+                f"exact match"
+            )
+
+        return RiskTierPlan(
+            direction=direction,
+            target_avg=target_avg,
+            sl_price=sl_price,
+            risk_amount=risk_amount,
+            width_pct=width_pct,
+            tier_plan=plan,
+            notional=plan.total_value,
+            max_loss_if_all_filled=risk_amount,
+            max_loss_if_only_worst_rung=max_loss_worst,
+            distance_to_sl_pct=distance / plan.avg_fill_price,
+            avg_drift_pct=avg_drift,
+        )
+
+    def execute_risk_tier_plan(
+        self, plan: RiskTierPlan
+    ) -> Tuple[List[Optional[Order]], Optional[Order]]:
+        """Execute the entry ladder, then place a single reduce-only stop.
+
+        Order of operations: entries first (limit orders away from market,
+        unlikely to fill in the sub-second window), then the SL. The SL
+        is placed with ``triggerQuantity="100%"`` and ``reduceOnly=True``
+        so it tracks the *actual* position size — works correctly whether
+        zero, some, or all entry rungs filled.
+
+        If SL placement itself fails, the partial position is unhedged.
+        That case is surfaced loudly so the user can place SL manually.
+
+        Returns:
+            (entry_orders, sl_order) — sl_order is None if placement failed.
+        """
+        entry_orders = self.execute_tier_plan(plan.tier_plan)
+
+        # SL closes a long with an Ask, a short with a Bid.
+        sl_side = "Ask" if plan.direction == Direction.LONG else "Bid"
+
+        try:
+            response = self.client.place_order(
+                symbol=plan.tier_plan.symbol,
+                side=sl_side,
+                order_type="Market",
+                trigger_price=plan.sl_price,
+                trigger_by="MarkPrice",
+                trigger_quantity="100%",
+                reduce_only=True,
+                auto_lend_redeem=False,
+            )
+            sl_order = Order(response)
+            with self._orders_lock:
+                self.open_orders[sl_order.order_id] = sl_order
+            print(
+                f"\nStop-loss placed: trigger ${float(plan.sl_price):.4f} "
+                f"(MarkPrice), reduceOnly, 100% of position"
+            )
+            return entry_orders, sl_order
+        except Exception as e:
+            print(
+                f"\n⚠ FAILED to place stop-loss: {e}\n"
+                f"⚠ Any filled entry rungs are UNHEDGED. Place a stop "
+                f"manually at {plan.sl_price} immediately, or cancel "
+                f"the entry ladder."
+            )
+            return entry_orders, None

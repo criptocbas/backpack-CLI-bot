@@ -451,7 +451,11 @@ class BackpackClient:
                    quote_quantity: Optional[Any] = None,
                    time_in_force: str = "GTC",
                    client_order_id: Optional[int] = None,
-                   auto_lend_redeem: bool = True) -> Dict:
+                   auto_lend_redeem: bool = True,
+                   trigger_price: Optional[Any] = None,
+                   trigger_by: Optional[str] = None,
+                   trigger_quantity: Optional[str] = None,
+                   reduce_only: bool = False) -> Dict:
         """Place a new order.
 
         Args:
@@ -460,7 +464,8 @@ class BackpackClient:
             order_type: Order type ("Limit" or "Market")
             quantity: Base-asset quantity (Decimal preferred, float/int accepted).
                 Required for limit orders; optional for market orders if
-                ``quote_quantity`` is given instead.
+                ``quote_quantity`` is given instead. Also optional when
+                ``trigger_quantity`` is provided (e.g. "100%" for stops).
             price: Limit price (Decimal preferred). Ignored for market orders.
                 For sell limit orders it is rounded UP to the tick so the
                 resulting ask is never below the user's target; for buy limit
@@ -469,12 +474,36 @@ class BackpackClient:
                 $100"). Only valid when ``order_type == "Market"``.
             time_in_force: Time in force (GTC, IOC, FOK)
             client_order_id: Optional client order ID (uint32 per Backpack API)
+            auto_lend_redeem: Spot only. Sends autoLendRedeem=true so Backpack
+                redeems lent balance to fill the order. No effect on perps;
+                pass False for perp orders to keep the payload clean.
+            trigger_price: Trigger price for stop / take-profit orders. Sent
+                as ``triggerPrice``. Order sits at status="TriggerPending"
+                until mark/last/index (per ``trigger_by``) hits this price.
+            trigger_by: Reference price for trigger evaluation —
+                "MarkPrice" (default for stops), "LastPrice", or "IndexPrice".
+            trigger_quantity: Trigger order size — either an absolute string
+                ("0.5") or a percent of position ("100%"). When set, an
+                explicit ``quantity`` is not required; the actual fill size
+                is determined at trigger time.
+            reduce_only: Perp-only. When true, the order can only reduce
+                (never reverse) the current position. Backpack clamps the
+                effective quantity down to current position size, making this
+                the safe choice for stop-losses placed before all entry
+                rungs have filled.
 
         Returns:
             Order response
         """
-        if quantity is None and quote_quantity is None:
-            raise ValueError("Must provide quantity or quote_quantity")
+        has_qty_spec = (
+            quantity is not None
+            or quote_quantity is not None
+            or trigger_quantity is not None
+        )
+        if not has_qty_spec:
+            raise ValueError(
+                "Must provide quantity, quote_quantity, or trigger_quantity"
+            )
         if quote_quantity is not None and order_type != "Market":
             raise ValueError("quote_quantity is only valid for Market orders")
 
@@ -500,11 +529,32 @@ class BackpackClient:
             rounding = ROUND_UP if side == "Ask" else ROUND_DOWN
             data["price"] = self.round_to_precision(price, tick_size, rounding=rounding)
 
+        if trigger_price is not None:
+            # Trigger ticks share the tick size with limit prices. Round
+            # in the side-conservative direction so a long-SL (Ask) trigger
+            # fires at a price >= user target (less loss) and a short-SL
+            # (Bid) trigger fires at <= user target.
+            rounding = ROUND_UP if side == "Ask" else ROUND_DOWN
+            data["triggerPrice"] = self.round_to_precision(
+                trigger_price, tick_size, rounding=rounding
+            )
+        if trigger_by is not None:
+            data["triggerBy"] = trigger_by
+        if trigger_quantity is not None:
+            # Send as-is; "100%" or absolute decimal string. Backpack
+            # serializes this as a string union, so don't coerce to number.
+            data["triggerQuantity"] = str(trigger_quantity)
+
         if client_order_id is not None:
             data["clientId"] = int(client_order_id)
 
         if auto_lend_redeem:
             data["autoLendRedeem"] = True
+
+        if reduce_only:
+            # Bool stays a Python bool — _generate_signature lowercases it
+            # to match the JSON wire format.
+            data["reduceOnly"] = True
 
         return self._request("POST", "/api/v1/order", data=data, instruction="orderExecute")
 
@@ -551,10 +601,22 @@ class BackpackClient:
             params["symbol"] = symbol
         return self._request("GET", "/api/v1/fills", params=params, instruction="fillHistoryQueryAll")
 
-    def get_positions(self) -> List[Dict]:
-        """Get current positions.
+    def get_perp_positions(self) -> List[Dict]:
+        """Get current perpetual futures positions.
 
         Returns:
-            List of positions
+            List of FuturePosition payloads with fields: symbol, netQuantity,
+            netExposureQuantity, netExposureNotional, entryPrice, markPrice,
+            breakEvenPrice, estLiquidationPrice, pnlRealized, pnlUnrealized,
+            imf, mmf, etc.
         """
-        return self._request("GET", "/api/v1/positions", instruction="positionQuery")
+        return self._request("GET", "/api/v1/position", instruction="positionQuery")
+
+    def get_account_settings(self) -> Dict:
+        """Get account-wide settings, including ``leverageLimit``.
+
+        Backpack uses a single account-wide leverage; there is no per-symbol
+        or per-order leverage parameter. Read it once and surface it in
+        previews so the user sees the margin context for their order.
+        """
+        return self._request("GET", "/api/v1/account", instruction="accountQuery")

@@ -1,6 +1,10 @@
 # Backpack CLI Bot
 
-A Python CLI trading bot for Backpack Exchange. The flagship feature is **tiered (DCA) limit ladders** via `tb`/`ts` commands. Single-user, personal tool — no need for backwards-compat shims, feature flags, or multi-tenancy abstractions.
+A Python CLI trading bot for Backpack Exchange. Two flagship features:
+- **Tiered (DCA) limit ladders** for spot via `tb`/`ts` commands.
+- **Risk-sized tiered perp entries** via `tlong`/`tshort` — symmetric ladder around a target avg, total qty back-solved from the user's stop-loss + risk budget, automatic reduce-only stop placed after the entries.
+
+Single-user, personal tool — no need for backwards-compat shims, feature flags, or multi-tenancy abstractions.
 
 ## Running it
 
@@ -15,8 +19,8 @@ Credentials live in `.env` (`BACKPACK_API_KEY`, `BACKPACK_API_SECRET`). `config.
 
 Three strict layers, bottom-up. Don't blur the boundaries.
 
-- **`api/backpack.py`** — HTTP client. ED25519 request signing, rate limiter, retry loop with jitter + `Retry-After`. One method per Backpack endpoint (`place_order`, `get_account`, `get_collateral`, `get_open_orders`, …).
-- **`core/order_manager.py`** — Domain layer. `Order` wraps API responses. `TierPlan` is a pure dataclass. `build_tier_plan` does all the Decimal math (price/weight generation, per-rung rounding, exchange min/max filters). `execute_tier_plan` fans out with a `ThreadPoolExecutor` (5 workers, serialized at HTTP by the rate limiter).
+- **`api/backpack.py`** — HTTP client. ED25519 request signing, rate limiter, retry loop with jitter + `Retry-After`. One method per Backpack endpoint (`place_order`, `get_account`, `get_collateral`, `get_open_orders`, `get_perp_positions`, `get_account_settings`, …). `place_order` carries trigger fields (`trigger_price`, `trigger_by`, `trigger_quantity`, `reduce_only`) used by the risk-tier flow for stops.
+- **`core/order_manager.py`** — Domain layer. `Order` wraps API responses. `TierPlan` is a pure dataclass; `RiskTierPlan` wraps a `TierPlan` with the risk inputs (target avg, SL, risk amount) and derived metrics. `build_tier_plan` does all the Decimal math (price/weight generation, per-rung rounding, exchange min/max filters). `build_risk_tier_plan` reuses the same price/weight helpers, computes the ladder's actual weighted-avg fill, and back-solves total qty from `risk / |actual_avg − SL|`. `execute_tier_plan` fans out with a `ThreadPoolExecutor` (5 workers, serialized at HTTP by the rate limiter); `execute_risk_tier_plan` runs the entry ladder then places one reduce-only stop tracking 100% of position.
 - **`ui/cli.py`** — Rich TUI. One handler per keystroke (`handle_buy_market`, `handle_tiered_sell`, …). Preflight balance checks before calling into `order_manager`.
 - `utils/` — pure formatters (no side effects).
 - `main.py` — thin entry point.
@@ -46,15 +50,24 @@ Prices and quantities are `Decimal` end-to-end. Don't introduce `float` in the o
 ### Trigger-pending perp orders look weird
 Old stop-loss / take-profit orders show up in `/api/v1/orders` with `status="TriggerPending"`, `quantity="0"`, and no `price`. The Order parser handles missing fields safely. They're rendered in the Open Orders table with zeros — not a bug.
 
+### Risk-tier perp flow: SL is one reduce-only order, not per-rung
+`tlong`/`tshort` place the entry ladder first, then **one** stop with `reduceOnly=true`, `triggerQuantity="100%"`, `triggerBy="MarkPrice"`. Backpack clamps the effective qty down to current position size on trigger, so the same stop works whether 0, 5, or all 30 entries filled. Don't be tempted to attach per-rung `stopLossTriggerPrice` fields — that creates N stops and they over-close. The single-SL design relies on the clamp behavior, so don't change `triggerQuantity` away from `"100%"`.
+
+### Risk-tier sizing uses *actual* avg, not target
+`build_risk_tier_plan` builds the ladder, computes the actual weighted-avg fill (which equals target exactly only for `LINEAR_EVEN` with flat weights), then sizes total qty as `risk / |actual_avg − SL|`. This guarantees realized loss = risk budget if all rungs fill, regardless of distribution. Don't "correct" by sizing off `target_avg` — pyramid/geometric distributions will then under- or over-shoot the risk budget. The preview surfaces the drift; if drift > 0.5% a warning is appended.
+
+### Perp orders skip `autoLendRedeem`
+Backpack's autoLendRedeem field has no effect on perp orders (collateral lives in netEquity, not lent USDC). The risk-tier executor explicitly passes `auto_lend_redeem=False` for both entry rungs and the SL to keep payloads clean. Existing spot `tb`/`ts` flows still pass it as True.
+
 ## Style
 
 - **Decimal for money, int for counts, str for IDs.** Never `float` in the order path.
 - **No comments that paraphrase the code.** The codebase is mostly uncommented on purpose — add one only when *why* is non-obvious.
 - **Silent failures are forbidden in order paths.** Either re-raise, or return a structured result the caller can log.
-- **No tests yet.** `_generate_prices` and `_generate_size_weights` in `core/order_manager.py` plus `_generate_signature` in `api/backpack.py` are the highest-value targets when we add them.
+- **No tests yet.** `_generate_prices`, `_generate_size_weights`, and the `build_risk_tier_plan` math (target/actual avg drift, risk-budget invariant, ladder-vs-SL validation) in `core/order_manager.py` plus `_generate_signature` in `api/backpack.py` are the highest-value targets when we add them.
 
 ## Known paper cuts (low-priority)
 
 - **TOCTOU on preflight balance check** — balance is fetched once at handler entry, then the order is sent. A fill or deposit between the two can invalidate the check. Server rejects cleanly, so low impact; not worth fixing unless this tool goes multi-user.
-- **`ui/cli.py` is ~900 lines** — readable, but the buy/sell handlers duplicate ~40 lines of preflight scaffolding. Extract `_preflight_buy` / `_preflight_sell` helpers when convenient.
+- **`ui/cli.py` is ~1100 lines** — readable, but the buy/sell handlers duplicate ~40 lines of preflight scaffolding. Extract `_preflight_buy` / `_preflight_sell` helpers when convenient.
 - **No collateral-aware sellable ceiling in the UI** — see "Cross-margin collateral" above.

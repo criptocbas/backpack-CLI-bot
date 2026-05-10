@@ -15,7 +15,9 @@ from rich.text import Text
 from datetime import datetime
 
 from api.backpack import BackpackClient
-from core.order_manager import OrderManager, Distribution, TierPlan
+from core.order_manager import (
+    OrderManager, Distribution, TierPlan, RiskTierPlan, Direction,
+)
 from utils.helpers import (
     format_price, format_quantity, format_percentage,
     format_currency, parse_order_input
@@ -168,6 +170,8 @@ class CLI:
         help_text.append("k - Limit sell\n", style="magenta")
         help_text.append("tb - Tiered buy | ", style="bold cyan")
         help_text.append("ts - Tiered sell\n", style="bold magenta")
+        help_text.append("tlong - Risk-sized perp long | ", style="bold green")
+        help_text.append("tshort - Risk-sized perp short\n", style="bold red")
         help_text.append("o - Refresh orders | ", style="white")
         help_text.append("c - Cancel all orders | ", style="white")
         help_text.append("cr - Cancel price range\n", style="yellow")
@@ -876,6 +880,185 @@ class CLI:
 
         self.console.input("\nPress Enter to continue...")
 
+    def _render_risk_plan_preview(self, plan: RiskTierPlan) -> None:
+        """Preview a risk-sized tier plan with the underlying ladder and
+        the risk-side metrics (target avg, SL, max-loss scenarios)."""
+        direction_label = "LONG" if plan.direction == Direction.LONG else "SHORT"
+        side_label = "Bid" if plan.direction == Direction.LONG else "Ask"
+
+        self.console.print("\n[bold]Risk-sized Plan Preview:[/bold]")
+        self.console.print(f"  Symbol:        {plan.tier_plan.symbol}")
+        self.console.print(
+            f"  Direction:     [bold]{direction_label}[/bold] ({side_label})"
+        )
+        self.console.print(f"  Target avg:    ${float(plan.target_avg):.4f}")
+        self.console.print(
+            f"  Actual avg:    ${float(plan.tier_plan.avg_fill_price):.4f} "
+            f"({float(plan.avg_drift_pct) * 100:+.3f}%)"
+        )
+        self.console.print(
+            f"  Stop-loss:     ${float(plan.sl_price):.4f} "
+            f"({float(plan.distance_to_sl_pct) * 100:.2f}% from avg)"
+        )
+        self.console.print(
+            f"  Width:         ±{float(plan.width_pct) * 100:.2f}% "
+            f"around target"
+        )
+        self.console.print(
+            f"  Risk budget:   ${float(plan.risk_amount):.2f}"
+        )
+        self.console.print(
+            f"  Total qty:     {float(plan.tier_plan.total_quantity):.6f}"
+        )
+        self.console.print(
+            f"  Notional:      ${float(plan.notional):.2f}"
+        )
+        self.console.print(
+            f"  Max loss (all rungs filled, SL hit):  "
+            f"[bold]${float(plan.max_loss_if_all_filled):.2f}[/bold]"
+        )
+        self.console.print(
+            f"  Max loss (only worst rung filled):    "
+            f"${float(plan.max_loss_if_only_worst_rung):.2f}"
+        )
+
+        # Reuse the existing rung-table renderer for the underlying ladder.
+        self._render_plan_preview(plan.tier_plan)
+
+    def _show_account_leverage(self) -> None:
+        """Best-effort display of account-wide leverage. Silent on failure."""
+        try:
+            settings = self.client.get_account_settings() or {}
+            lev = settings.get("leverageLimit")
+            if lev is not None:
+                self.console.print(
+                    f"[dim]Account leverage limit: {lev}x "
+                    f"(account-wide; change via Backpack settings)[/dim]"
+                )
+        except Exception:
+            pass
+
+    def _handle_risk_tiered(self, direction: Direction):
+        """Shared flow for tlong / tshort.
+
+        Prompts for target avg, SL, risk, width, # rungs; previews the plan
+        with risk metrics; on confirm, places the entry ladder then a single
+        reduce-only stop tracking 100% of the resulting position.
+        """
+        try:
+            label = "LONG" if direction == Direction.LONG else "SHORT"
+            color = "green" if direction == Direction.LONG else "red"
+            self.console.print(
+                f"[bold {color}]Risk-sized Tiered {label} Entry "
+                f"(perps only)[/bold {color}]"
+            )
+            self.console.print(
+                f"Symbol: {self.current_symbol} | "
+                f"Current price: ${format_price(self.current_price)}"
+            )
+            self._show_account_leverage()
+            self.console.print()
+
+            if not self.current_symbol.endswith("_PERP"):
+                self.console.print(
+                    f"[red]{self.current_symbol} is not a perp market. "
+                    f"Switch with 'sym' to a *_PERP symbol first.[/red]"
+                )
+                self.console.input("\nPress Enter to continue...")
+                return
+
+            target_avg = _dec(
+                self.console.input(
+                    f"[{color}]Target average entry: [/{color}]"
+                ),
+                "target average",
+            )
+            sl_price = _dec(
+                self.console.input(f"[{color}]Stop-loss price: [/{color}]"),
+                "stop-loss",
+            )
+            risk_amount = _dec(
+                self.console.input(
+                    f"[{color}]Risk amount (USD to lose if SL hits): "
+                    f"[/{color}]"
+                ),
+                "risk amount",
+            )
+            width_str = self.console.input(
+                f"[{color}]Half-width % around target (e.g. 2 for "
+                f"±2%): [/{color}]"
+            ).strip()
+            width_pct = _dec(width_str, "width") / Decimal(100)
+            num_orders = int(
+                self.console.input(
+                    f"[{color}]Number of rungs: [/{color}]"
+                ).strip()
+            )
+
+            distribution, size_scale = self._prompt_distribution()
+
+            plan = self.order_manager.build_risk_tier_plan(
+                symbol=self.current_symbol,
+                direction=direction,
+                target_avg=target_avg,
+                sl_price=sl_price,
+                risk_amount=risk_amount,
+                width_pct=width_pct,
+                num_orders=num_orders,
+                distribution=distribution,
+                size_scale=size_scale,
+            )
+            if plan is None:
+                self.console.print("[red]Failed to build plan[/red]")
+                self.console.input("\nPress Enter to continue...")
+                return
+
+            self._render_risk_plan_preview(plan)
+
+            self.console.print(
+                "\n[dim]Confirming will place the entry ladder, then a "
+                "MarkPrice stop-loss with reduceOnly=true and "
+                "triggerQuantity=100% (auto-tracks position size).[/dim]"
+            )
+            confirm = self.console.input("\n[yellow]Confirm? (y/n): [/yellow]")
+            if confirm.lower() != 'y':
+                self.console.print("[yellow]Cancelled[/yellow]")
+                self.console.input("\nPress Enter to continue...")
+                return
+
+            entries, sl = self.order_manager.execute_risk_tier_plan(plan)
+            successful = sum(1 for o in entries if o is not None)
+            self.console.print(
+                f"\n[bold green]Entry rungs placed: "
+                f"{successful}/{num_orders}[/bold green]"
+            )
+            if sl is not None:
+                self.console.print(
+                    f"[bold green]Stop-loss order ID: "
+                    f"{sl.order_id}[/bold green]"
+                )
+            else:
+                self.console.print(
+                    f"[bold red]Stop-loss FAILED — see warning above[/bold red]"
+                )
+
+        except ValueError:
+            self.console.print(
+                "[red]Invalid input. Please enter valid numbers.[/red]"
+            )
+        except Exception as e:
+            self.console.print(f"[red]Error: {e}[/red]")
+
+        self.console.input("\nPress Enter to continue...")
+
+    def handle_tiered_long(self):
+        """Handle a risk-sized tiered long entry on a perp market."""
+        self._handle_risk_tiered(Direction.LONG)
+
+    def handle_tiered_short(self):
+        """Handle a risk-sized tiered short entry on a perp market."""
+        self._handle_risk_tiered(Direction.SHORT)
+
     def _auto_refresh_worker(self):
         """Background worker that auto-refreshes data."""
         while self.running:
@@ -919,6 +1102,10 @@ class CLI:
                 self.handle_tiered_buy()
             elif command == 'ts':
                 self.handle_tiered_sell()
+            elif command == 'tlong':
+                self.handle_tiered_long()
+            elif command == 'tshort':
+                self.handle_tiered_short()
             elif command == 'o':
                 self.order_manager.refresh_open_orders()
                 self.console.print("[green]Orders refreshed[/green]")
