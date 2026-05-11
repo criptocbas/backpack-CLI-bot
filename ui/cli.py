@@ -594,7 +594,9 @@ class CLI:
 
     def handle_change_symbol(self):
         """Handle symbol change."""
-        new_symbol = self.console.input("[yellow]Enter new symbol (e.g., BTC_USDC): [/yellow]")
+        new_symbol = self.console.input(
+            "[yellow]Enter new symbol (spot: BTC_USDC, perp: SOL_USDC_PERP): [/yellow]"
+        )
         new_symbol = new_symbol.strip().upper()
 
         if "_" not in new_symbol:
@@ -605,6 +607,12 @@ class CLI:
         self.console.print(f"[dim]Validating {new_symbol}...[/dim]")
         if not self.client.is_valid_symbol(new_symbol):
             self.console.print(f"[red]'{new_symbol}' is not a valid trading pair on Backpack Exchange[/red]")
+            if new_symbol.endswith("_PERP") and new_symbol.count("_") == 1:
+                base = new_symbol[: -len("_PERP")]
+                self.console.print(
+                    f"[yellow]Hint: Backpack perps are quoted in USDC — try "
+                    f"'{base}_USDC_PERP'.[/yellow]"
+                )
             self.console.input("\nPress Enter to continue...")
             return
 
@@ -962,7 +970,8 @@ class CLI:
             if not self.current_symbol.endswith("_PERP"):
                 self.console.print(
                     f"[red]{self.current_symbol} is not a perp market. "
-                    f"Switch with 'sym' to a *_PERP symbol first.[/red]"
+                    f"Switch with 'sym' to a *_USDC_PERP symbol "
+                    f"(e.g., SOL_USDC_PERP) first.[/red]"
                 )
                 self.console.input("\nPress Enter to continue...")
                 return

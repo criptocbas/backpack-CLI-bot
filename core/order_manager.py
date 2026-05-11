@@ -783,7 +783,7 @@ class OrderManager:
         if not symbol.endswith("_PERP"):
             print(
                 f"Risk-tier plans are perp-only — '{symbol}' is not a "
-                f"perp symbol. Use a *_PERP market."
+                f"perp symbol. Use a *_USDC_PERP market (e.g., SOL_USDC_PERP)."
             )
             return None
 
