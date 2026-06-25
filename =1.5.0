@@ -1,8 +1,0 @@
-Collecting PyNaCl
-  Downloading pynacl-1.6.0-cp38-abi3-manylinux_2_34_x86_64.whl.metadata (9.4 kB)
-Requirement already satisfied: cffi>=1.4.1 in /home/cbas/Documents/backpack-bot/.venv/lib/python3.12/site-packages (from PyNaCl) (2.0.0)
-Requirement already satisfied: pycparser in /home/cbas/Documents/backpack-bot/.venv/lib/python3.12/site-packages (from cffi>=1.4.1->PyNaCl) (2.23)
-Downloading pynacl-1.6.0-cp38-abi3-manylinux_2_34_x86_64.whl (1.4 MB)
-   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.4/1.4 MB 22.6 MB/s eta 0:00:00
-Installing collected packages: PyNaCl
-Successfully installed PyNaCl-1.6.0

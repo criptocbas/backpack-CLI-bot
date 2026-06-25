@@ -4,7 +4,7 @@ import sys
 import threading
 import time
 from decimal import Decimal, InvalidOperation
-from typing import Optional
+from typing import Dict, Optional
 from concurrent.futures import ThreadPoolExecutor
 from rich.console import Console
 from rich.table import Table
@@ -17,6 +17,7 @@ from datetime import datetime
 from api.backpack import BackpackClient
 from core.order_manager import (
     OrderManager, Distribution, TierPlan, RiskTierPlan, Direction,
+    PlanValidationError,
 )
 from utils.helpers import (
     format_price, format_quantity, format_percentage,
@@ -49,7 +50,8 @@ class CLI:
         self.current_symbol = config.DEFAULT_SYMBOL
         self.running = False
         self.current_price: Optional[Decimal] = None
-        self.balances = {}
+        self.balances: Dict[str, Dict[str, Decimal]] = {}
+        self.positions: list = []
 
         # Auto-refresh settings
         self.auto_refresh_interval = 10  # seconds
@@ -77,7 +79,7 @@ class CLI:
         time_since_refresh = int(time.time() - self.last_refresh_time) if self.last_refresh_time > 0 else 0
 
         header_text = Text()
-        header_text.append("Backpack Spot Trading Bot", style="bold cyan")
+        header_text.append("Backpack Trading Bot", style="bold cyan")
         header_text.append(f" | Symbol: ", style="white")
         header_text.append(f"{self.current_symbol}", style="bold yellow")
         header_text.append(f" | Price: ", style="white")
@@ -123,6 +125,56 @@ class CLI:
                     format_price(order.price),
                     f"{format_percentage(order.fill_percentage)}"
                 )
+
+        return table
+
+    def display_positions(self) -> Table:
+        """Create open perp positions table.
+
+        Returns:
+            Rich Table with open perp positions (signed quantity → side,
+            unrealized PnL colored by sign).
+        """
+        table = Table(title="Perp Positions", show_header=True, header_style="bold magenta")
+        table.add_column("Symbol", style="cyan")
+        table.add_column("Side", style="white")
+        table.add_column("Quantity", justify="right")
+        table.add_column("Entry", justify="right")
+        table.add_column("Mark", justify="right")
+        table.add_column("Liq.", justify="right")
+        table.add_column("uPnL", justify="right")
+
+        positions = self.positions  # local ref — never iterate the live attr
+
+        if not positions:
+            table.add_row("No open positions", "-", "-", "-", "-", "-", "-")
+            return table
+
+        def _px(value: Optional[Decimal]) -> str:
+            return format_price(value) if value is not None else "-"
+
+        for pos in positions:
+            net = pos["net_quantity"]
+            is_long = net > 0
+            side = Text("LONG" if is_long else "SHORT",
+                        style="green" if is_long else "red")
+
+            pnl = pos["pnl_unrealized"]
+            if pnl is None:
+                pnl_text = Text("-")
+            else:
+                pnl_text = Text(format_currency(pnl),
+                                style="green" if pnl >= 0 else "red")
+
+            table.add_row(
+                pos["symbol"],
+                side,
+                format_quantity(abs(net)),
+                _px(pos["entry_price"]),
+                _px(pos["mark_price"]),
+                _px(pos["liq_price"]),
+                pnl_text,
+            )
 
         return table
 
@@ -188,23 +240,32 @@ class CLI:
         Backpack returns balances as decimal strings; we store them as
         Decimal to avoid binary-float drift when they're summed or compared
         against order sizes.
+
+        The snapshot is built in a local dict and swapped into
+        ``self.balances`` only once it is complete. The auto-refresh thread
+        runs this concurrently with the main thread's dashboard render; a
+        plain ``clear()`` + repopulate would let the renderer iterate a
+        half-rebuilt dict (``RuntimeError: dictionary changed size during
+        iteration``). Reference assignment is atomic in CPython, so readers
+        always see a whole snapshot.
         """
         try:
             account_data = self.client.get_account()
-            self.balances.clear()
+            new_balances: Dict[str, Dict[str, Decimal]] = {}
 
             for asset, balance_data in account_data.items():
                 if isinstance(balance_data, dict):
                     free = Decimal(str(balance_data.get("available") or 0))
                     locked = Decimal(str(balance_data.get("locked") or 0))
                     staked = Decimal(str(balance_data.get("staked") or 0))
-                    lent = Decimal(str(balance_data.get("lent") or 0))
-                    self.balances[asset] = {
+                    # Lent balances are not reported on /api/v1/capital — they
+                    # are merged in from the collateral endpoint below.
+                    new_balances[asset] = {
                         "free": free,
                         "locked": locked,
                         "staked": staked,
-                        "lent": lent,
-                        "total": free + locked + staked + lent,
+                        "lent": Decimal(0),
+                        "total": free + locked + staked,
                     }
 
             # /api/v1/capital reports the spot wallet only; auto-lent
@@ -219,7 +280,7 @@ class CLI:
                     lent = Decimal(str(entry.get("lendQuantity") or 0))
                     if lent <= 0:
                         continue
-                    bal = self.balances.setdefault(asset, {
+                    bal = new_balances.setdefault(asset, {
                         "free": Decimal(0),
                         "locked": Decimal(0),
                         "staked": Decimal(0),
@@ -230,8 +291,45 @@ class CLI:
                     bal["total"] = bal["free"] + bal["locked"] + bal["staked"] + lent
             except Exception as e:
                 print(f"Error refreshing collateral: {e}")
+
+            # Atomic swap — readers never observe a partially built snapshot.
+            self.balances = new_balances
         except Exception as e:
             print(f"Error refreshing balances: {e}")
+
+    def refresh_positions(self):
+        """Refresh open perp positions from API.
+
+        Raises on API failure so the caller can honor ``silent`` (the
+        auto-refresh wrapper routes the error into its suppressible list).
+        The parsed snapshot is built locally and swapped in atomically — the
+        same concurrency discipline as :meth:`refresh_balances`.
+        """
+        def _opt(value) -> Optional[Decimal]:
+            if value is None:
+                return None
+            try:
+                return Decimal(str(value))
+            except (InvalidOperation, ValueError):
+                return None
+
+        raw = self.client.get_perp_positions() or []
+        positions = []
+        for p in raw:
+            if not isinstance(p, dict):
+                continue
+            net = _opt(p.get("netQuantity")) or Decimal(0)
+            if net == 0:  # flat positions linger in the API response — skip
+                continue
+            positions.append({
+                "symbol": p.get("symbol", "?"),
+                "net_quantity": net,
+                "entry_price": _opt(p.get("entryPrice")),
+                "mark_price": _opt(p.get("markPrice")),
+                "liq_price": _opt(p.get("estLiquidationPrice")),
+                "pnl_unrealized": _opt(p.get("pnlUnrealized")),
+            })
+        self.positions = positions
 
     def refresh_data(self, silent=False):
         """Refresh all data from API (parallel).
@@ -263,10 +361,17 @@ class CLI:
                     except Exception as e:
                         errors.append(f"ticker: {e}")
 
-                with ThreadPoolExecutor(max_workers=3) as executor:
+                def _refresh_positions():
+                    try:
+                        self.refresh_positions()
+                    except Exception as e:
+                        errors.append(f"positions: {e}")
+
+                with ThreadPoolExecutor(max_workers=4) as executor:
                     executor.submit(_refresh_balances)
                     executor.submit(_refresh_orders)
                     executor.submit(_refresh_ticker)
+                    executor.submit(_refresh_positions)
 
                 self.last_refresh_time = time.time()
 
@@ -288,6 +393,10 @@ class CLI:
 
         # Display orders
         self.console.print(self.display_orders())
+        self.console.print()
+
+        # Display perp positions
+        self.console.print(self.display_positions())
         self.console.print()
 
         # Display balances
@@ -776,11 +885,6 @@ class CLI:
                 distribution=distribution,
                 size_scale=size_scale,
             )
-            if plan is None:
-                self.console.print("[red]Failed to build plan[/red]")
-                self.console.input("\nPress Enter to continue...")
-                return
-
             self._render_plan_preview(plan)
 
             confirm = self.console.input("\n[yellow]Confirm? (y/n): [/yellow]")
@@ -796,6 +900,8 @@ class CLI:
                 f"successfully[/bold green]"
             )
 
+        except PlanValidationError as e:
+            self.console.print(f"[red]{e}[/red]")
         except ValueError:
             self.console.print("[red]Invalid input. Please enter valid numbers.[/red]")
         except Exception as e:
@@ -861,11 +967,6 @@ class CLI:
                 distribution=distribution,
                 size_scale=size_scale,
             )
-            if plan is None:
-                self.console.print("[red]Failed to build plan[/red]")
-                self.console.input("\nPress Enter to continue...")
-                return
-
             self._render_plan_preview(plan)
 
             confirm = self.console.input("\n[yellow]Confirm? (y/n): [/yellow]")
@@ -881,6 +982,8 @@ class CLI:
                 f"successfully[/bold green]"
             )
 
+        except PlanValidationError as e:
+            self.console.print(f"[red]{e}[/red]")
         except ValueError:
             self.console.print("[red]Invalid input. Please enter valid numbers.[/red]")
         except Exception as e:
@@ -1017,11 +1120,6 @@ class CLI:
                 distribution=distribution,
                 size_scale=size_scale,
             )
-            if plan is None:
-                self.console.print("[red]Failed to build plan[/red]")
-                self.console.input("\nPress Enter to continue...")
-                return
-
             self._render_risk_plan_preview(plan)
 
             self.console.print(
@@ -1051,6 +1149,8 @@ class CLI:
                     f"[bold red]Stop-loss FAILED — see warning above[/bold red]"
                 )
 
+        except PlanValidationError as e:
+            self.console.print(f"[red]{e}[/red]")
         except ValueError:
             self.console.print(
                 "[red]Invalid input. Please enter valid numbers.[/red]"
@@ -1086,7 +1186,10 @@ class CLI:
             return
 
         self.console.print("[cyan]Starting Backpack CLI Bot...[/cyan]")
-        self.console.print("[dim]Auto-refresh enabled: Updates every 10 seconds[/dim]")
+        self.console.print(
+            f"[dim]Auto-refresh enabled: Updates every "
+            f"{self.auto_refresh_interval} seconds[/dim]"
+        )
         self.refresh_data()
 
         # Start auto-refresh background thread
