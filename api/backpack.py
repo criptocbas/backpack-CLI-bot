@@ -12,6 +12,53 @@ from nacl.encoding import Base64Encoder
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 
 
+class BackpackError(Exception):
+    """Base class for every error raised by the Backpack client.
+
+    Subclasses Exception, so existing ``except Exception`` handlers keep
+    catching these unchanged — callers that want to react to a specific
+    failure (auth vs. rate limit vs. network) can catch the subclass.
+    """
+
+
+class BackpackAPIError(BackpackError):
+    """The exchange returned a non-2xx HTTP response.
+
+    ``status_code`` is the HTTP status and ``body`` is the truncated response
+    text when it is safe to surface (never populated for 401, whose body can
+    echo signing material).
+    """
+
+    def __init__(self, message: str, status_code: Optional[int] = None,
+                 body: Optional[str] = None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.body = body
+
+
+class BackpackAuthError(BackpackAPIError):
+    """Authentication/authorization failure (401/403) — bad key, bad
+    signature, or an API key without the required permissions."""
+
+
+class BackpackRateLimitError(BackpackAPIError):
+    """Rate limited (429) after retries were exhausted."""
+
+
+class BackpackNetworkError(BackpackError):
+    """A connection/timeout/transport failure after retries were exhausted."""
+
+
+def _http_error(status_code: int, message: str,
+                body: Optional[str] = None) -> BackpackAPIError:
+    """Map an HTTP status to the most specific BackpackAPIError subclass."""
+    if status_code in (401, 403):
+        return BackpackAuthError(message, status_code=status_code, body=body)
+    if status_code == 429:
+        return BackpackRateLimitError(message, status_code=status_code, body=body)
+    return BackpackAPIError(message, status_code=status_code, body=body)
+
+
 class BackpackClient:
     """Client for interacting with Backpack Exchange API."""
 
@@ -100,13 +147,18 @@ class BackpackClient:
         return signature, timestamp, str(window)
 
     def _wait_for_rate_limit(self):
-        """Enforce minimum interval between API requests."""
+        """Enforce minimum interval between API requests.
+
+        Uses ``time.monotonic`` so a wall-clock adjustment (NTP step, DST)
+        can't produce a negative elapsed (→ no throttling, request burst) or
+        a huge one (→ pathological sleep).
+        """
         with self._rate_lock:
-            now = time.time()
+            now = time.monotonic()
             elapsed = now - self._last_request_time
             if elapsed < self._min_request_interval:
                 time.sleep(self._min_request_interval - elapsed)
-            self._last_request_time = time.time()
+            self._last_request_time = time.monotonic()
 
     def _compute_backoff(self, attempt: int, retry_after: Optional[float] = None) -> float:
         """Exponential backoff with jitter, capped. Honors Retry-After if given."""
@@ -188,14 +240,17 @@ class BackpackClient:
                     last_exception = e
                     continue
 
-                # Build error message without exposing sensitive data
+                # Build error message without exposing sensitive data. A 401
+                # body can echo signing material, so it is never surfaced.
+                body: Optional[str] = None
                 error_msg = f"API request failed with status {status_code}"
                 try:
                     if hasattr(e.response, 'text') and e.response.text and status_code != 401:
-                        error_msg = f"{error_msg} - {e.response.text[:200]}"
+                        body = e.response.text[:200]
+                        error_msg = f"{error_msg} - {body}"
                 except Exception:
                     pass
-                raise Exception(error_msg)
+                raise _http_error(status_code, error_msg, body)
             except (requests.exceptions.ConnectionError,
                     requests.exceptions.Timeout,
                     requests.exceptions.ChunkedEncodingError) as e:
@@ -204,13 +259,17 @@ class BackpackClient:
                     time.sleep(self._compute_backoff(attempt))
                     last_exception = e
                     continue
-                raise Exception(
+                raise BackpackNetworkError(
                     f"API network error after {self._max_retries + 1} attempts: {str(e)}"
                 )
             except requests.exceptions.RequestException as e:
-                raise Exception(f"API request failed: {str(e)}")
+                raise BackpackNetworkError(f"API request failed: {str(e)}")
 
-        raise Exception(f"API request failed after {self._max_retries + 1} attempts: {str(last_exception)}")
+        # Defensive: the retry loop always raises on its final attempt, so
+        # this is unreachable in practice.
+        raise BackpackError(
+            f"API request failed after {self._max_retries + 1} attempts: {str(last_exception)}"
+        )
 
     # Public Endpoints
 
@@ -275,27 +334,33 @@ class BackpackClient:
     def get_market_precision(self, symbol: str) -> tuple[str, str]:
         """Get tick size and step size for a symbol.
 
+        Raises if the market cannot be fetched. This sits directly in the
+        order path (``place_order`` rounds prices/quantities with it), and a
+        *guessed* precision can silently misprice a live order — far worse
+        than failing the order outright. A successful response that omits the
+        fields still falls back to "0.01" (Backpack always includes them in
+        practice).
+
         Args:
             symbol: Trading pair symbol
 
         Returns:
             Tuple of (tick_size, step_size) as strings
+
+        Raises:
+            BackpackError: if the market specification cannot be fetched.
         """
-        try:
-            market = self.get_market(symbol)
-            filters = market.get("filters", {})
+        market = self.get_market(symbol)
+        filters = market.get("filters", {})
 
-            # Extract from nested structure
-            price_filters = filters.get("price", {})
-            quantity_filters = filters.get("quantity", {})
+        # Extract from nested structure
+        price_filters = filters.get("price", {}) or {}
+        quantity_filters = filters.get("quantity", {}) or {}
 
-            tick_size = price_filters.get("tickSize", "0.01")
-            step_size = quantity_filters.get("stepSize", "0.01")
+        tick_size = price_filters.get("tickSize", "0.01")
+        step_size = quantity_filters.get("stepSize", "0.01")
 
-            return tick_size, step_size
-        except Exception as e:
-            # Default fallback values
-            return "0.01", "0.01"
+        return tick_size, step_size
 
     def get_market_limits(self, symbol: str) -> Dict[str, Optional[Decimal]]:
         """Return the exchange-enforced price/quantity limits for a symbol.

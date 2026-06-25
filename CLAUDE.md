@@ -11,7 +11,10 @@ Single-user, personal tool — no need for backwards-compat shims, feature flags
 ```bash
 ./run.sh          # launch the TUI (wraps venv/bin/python main.py)
 ./venv/bin/python test_connection.py   # smoke-test API credentials only
+./venv/bin/python -m pytest            # run the unit suite (no network)
 ```
+
+Dev/test deps: `./venv/bin/python -m pip install -r requirements-dev.txt`.
 
 Credentials live in `.env` (`BACKPACK_API_KEY`, `BACKPACK_API_SECRET`). `config.py` loads them.
 
@@ -19,9 +22,9 @@ Credentials live in `.env` (`BACKPACK_API_KEY`, `BACKPACK_API_SECRET`). `config.
 
 Three strict layers, bottom-up. Don't blur the boundaries.
 
-- **`api/backpack.py`** — HTTP client. ED25519 request signing, rate limiter, retry loop with jitter + `Retry-After`. One method per Backpack endpoint (`place_order`, `get_account`, `get_collateral`, `get_open_orders`, `get_perp_positions`, `get_account_settings`, …). `place_order` carries trigger fields (`trigger_price`, `trigger_by`, `trigger_quantity`, `reduce_only`) used by the risk-tier flow for stops.
-- **`core/order_manager.py`** — Domain layer. `Order` wraps API responses. `TierPlan` is a pure dataclass; `RiskTierPlan` wraps a `TierPlan` with the risk inputs (target avg, SL, risk amount) and derived metrics. `build_tier_plan` does all the Decimal math (price/weight generation, per-rung rounding, exchange min/max filters). `build_risk_tier_plan` reuses the same price/weight helpers, computes the ladder's actual weighted-avg fill, and back-solves total qty from `risk / |actual_avg − SL|`. `execute_tier_plan` fans out with a `ThreadPoolExecutor` (5 workers, serialized at HTTP by the rate limiter); `execute_risk_tier_plan` runs the entry ladder then places one reduce-only stop tracking 100% of position.
-- **`ui/cli.py`** — Rich TUI. One handler per keystroke (`handle_buy_market`, `handle_tiered_sell`, …). Preflight balance checks before calling into `order_manager`.
+- **`api/backpack.py`** — HTTP client. ED25519 request signing, rate limiter, retry loop with jitter + `Retry-After`. One method per Backpack endpoint (`place_order`, `get_account`, `get_collateral`, `get_open_orders`, `get_perp_positions`, `get_account_settings`, …). `place_order` carries trigger fields (`trigger_price`, `trigger_by`, `trigger_quantity`, `reduce_only`) used by the risk-tier flow for stops. Errors raise a small hierarchy — `BackpackError` → `BackpackAPIError` (with `status_code`/`body`) → `BackpackAuthError` (401/403), `BackpackRateLimitError` (429), plus `BackpackNetworkError`. All subclass `Exception`, so existing `except Exception` handlers still catch them.
+- **`core/order_manager.py`** — Domain layer. `Order` wraps API responses. `TierPlan` is a pure dataclass; `RiskTierPlan` wraps a `TierPlan` with the risk inputs (target avg, SL, risk amount) and derived metrics. `build_tier_plan` does all the Decimal math (price/weight generation, per-rung rounding, exchange min/max filters). `build_risk_tier_plan` reuses the same price/weight helpers, computes the ladder's actual weighted-avg fill, and back-solves total qty from `risk / |actual_avg − SL|`. Both builders **raise `PlanValidationError` (a plain `Exception` subclass) on invalid input** — they never return `None`; the message is meant to be surfaced verbatim to the user. `execute_tier_plan` fans out with a `ThreadPoolExecutor` (5 workers, serialized at HTTP by the rate limiter); `execute_risk_tier_plan` runs the entry ladder then places one reduce-only stop tracking 100% of position.
+- **`ui/cli.py`** — Rich TUI. One handler per keystroke (`handle_buy_market`, `handle_tiered_sell`, …). Preflight balance checks before calling into `order_manager`. The dashboard renders open orders, **open perp positions** (`display_positions`, signed qty → side, colored uPnL), and spot balances. Balances/positions snapshots are built locally and swapped in atomically so the auto-refresh thread can't trip the render thread.
 - `utils/` — pure formatters (no side effects).
 - `main.py` — thin entry point.
 
@@ -59,12 +62,15 @@ Old stop-loss / take-profit orders show up in `/api/v1/orders` with `status="Tri
 ### Perp orders skip `autoLendRedeem`
 Backpack's autoLendRedeem field has no effect on perp orders (collateral lives in netEquity, not lent USDC). The risk-tier executor explicitly passes `auto_lend_redeem=False` for both entry rungs and the SL to keep payloads clean. Existing spot `tb`/`ts` flows still pass it as True.
 
+### `get_market_precision` raises rather than guessing
+It sits directly in the order path (`place_order` rounds prices/quantities with it). If the market spec can't be fetched it **raises** — a *guessed* tick (the old `0.01/0.01` fallback) can silently misprice a live order, which is worse than failing it. A successful response that merely omits the fields still defaults to `0.01`. Callers (`place_*`, tiered executors) already catch and fail the order cleanly.
+
 ## Style
 
 - **Decimal for money, int for counts, str for IDs.** Never `float` in the order path.
 - **No comments that paraphrase the code.** The codebase is mostly uncommented on purpose — add one only when *why* is non-obvious.
 - **Silent failures are forbidden in order paths.** Either re-raise, or return a structured result the caller can log.
-- **No tests yet.** `_generate_prices`, `_generate_size_weights`, and the `build_risk_tier_plan` math (target/actual avg drift, risk-budget invariant, ladder-vs-SL validation) in `core/order_manager.py` plus `_generate_signature` in `api/backpack.py` are the highest-value targets when we add them.
+- **Tests live in `tests/` (pytest, no network).** They cover the pure money-deciding logic: distribution math (`_generate_prices`, `_generate_size_weights`), side-aware `round_to_precision`, request signing (`_generate_signature`, incl. the bool-lowercasing rule), the risk-budget invariant + ladder/SL validation in `build_risk_tier_plan`, `build_tier_plan` validation rails, `get_market_precision` fetch-failure safety, and the display formatters. Execution paths are never exercised (they hit the network). Build with the `manager`/`manager_factory` and `client` fixtures in `conftest.py`. When you add order math, add a test here.
 
 ## Known paper cuts (low-priority)
 

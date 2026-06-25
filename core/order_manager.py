@@ -9,6 +9,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed, CancelledError
 from api.backpack import BackpackClient
 
 
+class PlanValidationError(Exception):
+    """A tier / risk-tier plan could not be built from the given inputs.
+
+    Carries a human-readable reason in ``str(err)``. Deliberately subclasses
+    ``Exception`` rather than ``ValueError`` so it is never swallowed by the
+    CLI's input-parsing ``except ValueError`` handlers — the caller is meant
+    to surface the message verbatim to the user.
+    """
+
+
 class Direction(str, Enum):
     """Direction of a perp position. Maps to a Backpack ``side``:
     LONG opens with ``Bid``; SHORT opens with ``Ask``.
@@ -434,7 +444,7 @@ class OrderManager:
         total_quantity=None,
         distribution: Distribution = Distribution.GEOMETRIC_PYRAMID,
         size_scale=Decimal("1.5"),
-    ) -> Optional[TierPlan]:
+    ) -> TierPlan:
         """Compute a tiered order plan without placing any orders.
 
         Exactly one of ``total_value`` or ``total_quantity`` must be provided.
@@ -453,39 +463,37 @@ class OrderManager:
             size_scale: Pyramid scale factor (1.0=flat, 1.5=mild, 3.0=aggressive)
 
         Returns:
-            TierPlan on success, None on invalid input (error printed).
+            TierPlan on success.
+
+        Raises:
+            PlanValidationError: if the inputs or resulting rungs are invalid
+                (bad bounds, sub-minimum rung size, out-of-range price, …).
         """
         def _as_dec(x):
             return x if isinstance(x, Decimal) else Decimal(str(x))
 
         # Validation
         if (total_value is None) == (total_quantity is None):
-            print("Must provide exactly one of total_value or total_quantity")
-            return None
+            raise PlanValidationError(
+                "Must provide exactly one of total_value or total_quantity"
+            )
         if num_orders <= 0:
-            print("Number of orders must be greater than 0")
-            return None
+            raise PlanValidationError("Number of orders must be greater than 0")
         low = _as_dec(price_low)
         high = _as_dec(price_high)
         scale = _as_dec(size_scale)
         if low >= high:
-            print("Lower price must be less than higher price")
-            return None
+            raise PlanValidationError("Lower price must be less than higher price")
         if low <= 0 or high <= 0:
-            print("Prices must be greater than 0")
-            return None
+            raise PlanValidationError("Prices must be greater than 0")
         if scale < Decimal(1):
-            print("size_scale must be >= 1.0")
-            return None
+            raise PlanValidationError("size_scale must be >= 1.0")
         if side not in ("Bid", "Ask"):
-            print(f"Invalid side: {side} (expected 'Bid' or 'Ask')")
-            return None
+            raise PlanValidationError(f"Invalid side: {side} (expected 'Bid' or 'Ask')")
         if total_value is not None and _as_dec(total_value) <= 0:
-            print("total_value must be > 0")
-            return None
+            raise PlanValidationError("total_value must be > 0")
         if total_quantity is not None and _as_dec(total_quantity) <= 0:
-            print("total_quantity must be > 0")
-            return None
+            raise PlanValidationError("total_quantity must be > 0")
 
         warnings: List[str] = []
 
@@ -543,24 +551,24 @@ class OrderManager:
 
         min_qty_rung = min(quantities)
         if min_quantity is not None and min_qty_rung < min_quantity:
-            print(
+            raise PlanValidationError(
                 f"Smallest rung qty {min_qty_rung} is below exchange "
                 f"minQuantity {min_quantity} for {symbol} — increase "
                 f"total or reduce number of orders"
             )
-            return None
         if step_size is not None and step_size > 0 and min_qty_rung < step_size:
-            print(
+            raise PlanValidationError(
                 f"Smallest rung qty {min_qty_rung} is below step size "
                 f"{step_size} — it will round down to zero"
             )
-            return None
         if min_price is not None and low < min_price:
-            print(f"Lower price {low} is below exchange minPrice {min_price}")
-            return None
+            raise PlanValidationError(
+                f"Lower price {low} is below exchange minPrice {min_price}"
+            )
         if max_price is not None and high > max_price:
-            print(f"Upper price {high} exceeds exchange maxPrice {max_price}")
-            return None
+            raise PlanValidationError(
+                f"Upper price {high} exceeds exchange maxPrice {max_price}"
+            )
 
         # Soft signal: still surface dust warnings for visibility
         min_rung_value = min(values)
@@ -676,6 +684,8 @@ class OrderManager:
         Convenience wrapper around :meth:`build_tier_plan` +
         :meth:`execute_tier_plan`. Callers that need to preview the plan or
         ask for confirmation should call the two methods separately.
+
+        Propagates :class:`PlanValidationError` if the plan is invalid.
         """
         plan = self.build_tier_plan(
             symbol,
@@ -688,8 +698,6 @@ class OrderManager:
             distribution=distribution,
             size_scale=size_scale,
         )
-        if plan is None:
-            return []
         return self.execute_tier_plan(plan)
 
     def tiered_buy(
@@ -747,7 +755,7 @@ class OrderManager:
         num_orders: int,
         distribution: Distribution = Distribution.LINEAR_EVEN,
         size_scale=Decimal("1.0"),
-    ) -> Optional[RiskTierPlan]:
+    ) -> RiskTierPlan:
         """Build a perp entry ladder centered on ``target_avg`` and sized
         so that loss-if-stopped equals ``risk_amount``.
 
@@ -775,17 +783,20 @@ class OrderManager:
                 GEOMETRIC_PYRAMID).
 
         Returns:
-            RiskTierPlan on success, None on invalid input (error printed).
+            RiskTierPlan on success.
+
+        Raises:
+            PlanValidationError: if the inputs are invalid (non-perp symbol,
+                SL on the wrong side, ladder crossing the SL, …).
         """
         def _as_dec(x):
             return x if isinstance(x, Decimal) else Decimal(str(x))
 
         if not symbol.endswith("_PERP"):
-            print(
+            raise PlanValidationError(
                 f"Risk-tier plans are perp-only — '{symbol}' is not a "
                 f"perp symbol. Use a *_USDC_PERP market (e.g., SOL_USDC_PERP)."
             )
-            return None
 
         target_avg = _as_dec(target_avg)
         sl_price = _as_dec(sl_price)
@@ -794,36 +805,31 @@ class OrderManager:
         size_scale = _as_dec(size_scale)
 
         if target_avg <= 0 or sl_price <= 0:
-            print("Prices must be greater than 0")
-            return None
+            raise PlanValidationError("Prices must be greater than 0")
         if risk_amount <= 0:
-            print("Risk amount must be greater than 0")
-            return None
+            raise PlanValidationError("Risk amount must be greater than 0")
         if num_orders <= 0:
-            print("Number of orders must be greater than 0")
-            return None
+            raise PlanValidationError("Number of orders must be greater than 0")
         if width_pct <= 0 or width_pct >= Decimal("0.5"):
-            print("width_pct must be in (0, 0.5) — half-width around target_avg")
-            return None
+            raise PlanValidationError(
+                "width_pct must be in (0, 0.5) — half-width around target_avg"
+            )
 
         # SL must be on the loss side of the target avg.
         if direction == Direction.LONG:
             if sl_price >= target_avg:
-                print(
+                raise PlanValidationError(
                     f"Long SL {sl_price} must be below target avg {target_avg}"
                 )
-                return None
             side = "Bid"
         elif direction == Direction.SHORT:
             if sl_price <= target_avg:
-                print(
+                raise PlanValidationError(
                     f"Short SL {sl_price} must be above target avg {target_avg}"
                 )
-                return None
             side = "Ask"
         else:
-            print(f"Invalid direction: {direction}")
-            return None
+            raise PlanValidationError(f"Invalid direction: {direction}")
 
         low = target_avg * (Decimal(1) - width_pct)
         high = target_avg * (Decimal(1) + width_pct)
@@ -831,17 +837,15 @@ class OrderManager:
         # Reject if the worst-priced rung would already be a loss before
         # the SL even fires.
         if direction == Direction.LONG and low <= sl_price:
-            print(
+            raise PlanValidationError(
                 f"Ladder low {low} crosses SL {sl_price} — reduce width_pct "
                 f"or move SL further from target"
             )
-            return None
         if direction == Direction.SHORT and high >= sl_price:
-            print(
+            raise PlanValidationError(
                 f"Ladder high {high} crosses SL {sl_price} — reduce width_pct "
                 f"or move SL further from target"
             )
-            return None
 
         # Compute the ladder's actual weighted avg, then size total qty
         # so that Q × |actual_avg - SL| == risk_amount exactly.
@@ -850,11 +854,11 @@ class OrderManager:
         actual_avg = sum((p * w for p, w in zip(prices, weights)), Decimal(0))
         distance = abs(actual_avg - sl_price)
         if distance <= 0:
-            print("Actual average equals SL — distance is zero")
-            return None
+            raise PlanValidationError("Actual average equals SL — distance is zero")
 
         total_qty = risk_amount / distance
 
+        # Propagates PlanValidationError (e.g. sub-minimum rung) to the caller.
         plan = self.build_tier_plan(
             symbol,
             side,
@@ -865,8 +869,6 @@ class OrderManager:
             distribution=distribution,
             size_scale=size_scale,
         )
-        if plan is None:
-            return None
 
         # Worst-priced rung = highest price for a long, lowest for a short.
         worst_idx = num_orders - 1 if direction == Direction.LONG else 0
